@@ -1,0 +1,26 @@
+[project]
+name = "s3-vectors-at-home"
+version = "0.1.0"
+description = "S3 vector search with MinIO, FAISS, and FastAPI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "minio",
+    "faiss-cpu",
+    "numpy",
+    "httpx",
+    "pydantic",
+    "sentence-transformers"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "pytest-cov"]
+
+[project.scripts]
+s3-vectors-cli = "s3_vectors_at_home.cli:main"
