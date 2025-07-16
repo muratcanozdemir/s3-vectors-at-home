@@ -1,7 +1,4 @@
 import uuid
-import tempfile
-import os
-import json
 from vectorstore import core
 
 def unique_id():

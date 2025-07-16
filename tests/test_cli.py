@@ -1,14 +1,11 @@
 import subprocess
 import uuid
 import json
-import tempfile
-import os
-from s3_vectors_at_home import cli
 
 def run_cli(args):
     # Use subprocess so that sys.argv is handled properly
     result = subprocess.run(
-        ["python", "-m", "s3_vectors_at_home.cli"] + args,
+        ["uv", "run", "s3_vectors_at_home.cli"] + args,
         capture_output=True,
         text=True,
         check=True
