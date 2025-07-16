@@ -42,3 +42,7 @@ uvicorn api.main:app
 
 ### Status
 `s3-vectors-cli status`
+
+# Contributing
+## Gotchas
+- Make sure you install numpy first. Huggingface apparently haven't addressed that issue with sentence-transformers needing a numpy lib first, so uv sync installs kinda fail.
