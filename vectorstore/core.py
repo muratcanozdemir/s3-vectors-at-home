@@ -13,7 +13,7 @@ BUCKET = "vectors"
 INDEX_OBJ = "faiss.index"
 
 client = Minio(MINIO_ENDPOINT, access_key=MINIO_ACCESS_KEY, secret_key=MINIO_SECRET_KEY, secure=False)
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+embedder = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
 
 def _ensure_bucket():
     if not client.bucket_exists(BUCKET):
@@ -82,8 +82,8 @@ def search_vectors(query: str, top_k: int = 5):
         _update_index()
         index, ids = _download_index()
     qv = embed(query)
-    D, I = index.search(qv, top_k)
-    return [ids[i] for i in I[0] if i < len(ids)]
+    D, Ind = index.search(qv, top_k)
+    return [ids[i] for i in Ind[0] if i < len(ids)]
 
 
 def get_document(doc_id: str):

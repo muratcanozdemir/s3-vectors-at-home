@@ -3,14 +3,15 @@ name = "s3-vectors-at-home"
 version = "0.1.0"
 description = "S3 vector search with MinIO, FAISS, and FastAPI"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi",
     "uvicorn",
     "minio",
-    "faiss-cpu",
     "numpy",
+    "faiss-cpu",
     "httpx",
+    "torch==2.2.2",
     "pydantic",
     "sentence-transformers"
 ]

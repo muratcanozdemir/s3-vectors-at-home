@@ -19,7 +19,7 @@ jobs:
       - name: Lint that thing
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          uvx ruff vectorstore s3_vectors_at_home api
+          uvx ruff check
 
   test:
     runs-on: ubuntu-latest
@@ -28,8 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv python install "3.11"
-          uv sync --all-extras dev
+          uv sync --all-extras
       - name: Start MinIO
         run: |
           docker compose -f minio/docker-compose.yaml up -d
@@ -52,7 +51,6 @@ jobs:
       - name: Install dependencies and build
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv python install "3.11"
           uv sync --all-extras dev
           uvx run hatchling build
 
@@ -65,8 +63,7 @@ jobs:
       - name: Create env, install and build
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv python install "3.11"
-          uv sync --all-extras dev
+          uv sync --all-extras
           uvx run hatchling build
       - name: Publish to PyPI
         env:
