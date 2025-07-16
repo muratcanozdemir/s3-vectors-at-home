@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -13,27 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install ruff
-        run: pip install ruff
-      - name: Lint with ruff
-        run: ruff vectorstore s3_vectors_at_home api
+      - name: Lint that thing
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uvx ruff vectorstore s3_vectors_at_home api
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
       - name: Install dependencies
         run: |
-          pip install uv
-          uv pip install -r pyproject.toml --extra dev
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv python install "3.11"
+          uv sync --all-extras dev
       - name: Start MinIO
         run: |
           docker compose -f minio/docker-compose.yaml up -d
@@ -44,21 +40,21 @@ jobs:
           echo "MINIO_ACCESS_KEY=minioadmin" >> $GITHUB_ENV
           echo "MINIO_SECRET_KEY=minioadmin123" >> $GITHUB_ENV
       - name: Run tests
-        run: pytest --cov
+        run: |
+          source .venv/bin/activate
+          pytest --cov
 
   build:
     runs-on: ubuntu-latest
     needs: [test, lint]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install build backend
-        run: pip install hatchling
-      - name: Build package
-        run: python -m hatchling build
+      - name: Install dependencies and build
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv python install "3.11"
+          uv sync --all-extras dev
+          uvx run hatchling build
 
   publish:
     if: github.event_name == 'release'
@@ -66,18 +62,15 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install build backend
-        run: pip install hatchling
-      - name: Build package
-        run: python -m hatchling build
+      - name: Create env, install and build
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv python install "3.11"
+          uv sync --all-extras dev
+          uvx run hatchling build
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          pip install twine
-          twine upload dist/*
+          uvx twine upload dist/*

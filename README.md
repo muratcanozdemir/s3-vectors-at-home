@@ -21,24 +21,24 @@ uvicorn api.main:app
 
 ## Sample CLI commands
 ### Single upload
-s3-vectors-cli upload --doc-id foo --text "My text"
+`s3-vectors-cli upload --doc-id foo --text "My text"`
 
 ### Bulk upload
-s3-vectors-cli bulk-upload --file docs.json
+`s3-vectors-cli bulk-upload --file docs.json`
 // where docs.json is:
 // `[{"doc_id": "a", "text": "abc"}, {"doc_id": "b", "text": "xyz"}]`
 
 ### Search
-s3-vectors-cli search --query "my search text" --top-k 3
+`s3-vectors-cli search --query "my search text" --top-k 3`
 
 ### Get doc
-s3-vectors-cli get --doc-id foo
+`s3-vectors-cli get --doc-id foo`
 
 ### List docs
-s3-vectors-cli list --skip 0 --limit 10
+`s3-vectors-cli list --skip 0 --limit 10`
 
 ### Delete doc
-s3-vectors-cli delete --doc-id foo
+`s3-vectors-cli delete --doc-id foo`
 
 ### Status
-s3-vectors-cli status
+`s3-vectors-cli status`
