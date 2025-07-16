@@ -5,10 +5,10 @@ description = "S3 vector search with MinIO, FAISS, and FastAPI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "numpy",
     "fastapi",
     "uvicorn",
     "minio",
-    "numpy",
     "faiss-cpu",
     "httpx",
     "torch==2.2.2",
