@@ -1,0 +1,70 @@
+# Codebase Exploration: Core Hardening (bugs, architecture, golden tests, CI/CD)
+
+**Generated:** 2026-08-26
+**Feature:** Audit the whole `s3-vectors-at-home` repo — find bugs, make explicit the architectural decisions currently implicit in the code, reimplement pieces where warranted, add golden (deterministic, regression-style) tests, and get CI/CD actually working.
+
+**Scope note:** This repo is ~250 lines across 6 source files (`vectorstore/core.py`, `api/main.py`, `s3_vectors_at_home/cli.py`, 3 test files, 1 CI workflow). I read every source file directly rather than dispatching parallel sub-agents — for a codebase this size, agents would re-read the same six files I already read in full, at added cost and no added coverage. Several findings below were reproduced live in this environment (`uv sync` + `uv run`), not just inferred from reading — those are marked **[VERIFIED]**.
+
+---
+
+## How the system works today
+
+- **`vectorstore/core.py`** is the entire domain layer. At **import time** (module load, not app startup) it: reads `MINIO_ENDPOINT`/`MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` from env (raises uncaught `KeyError` if any are unset), constructs a `Minio` client, loads a `SentenceTransformer("all-MiniLM-L6-v2")` from Hugging Face, and calls `_ensure_bucket()` against the live MinIO server. There is no factory/DI — `client` and `embedder` are module-level singletons imported by both `api/main.py` and `s3_vectors_at_home/cli.py`.
+- **Storage layout in MinIO** (single bucket `vectors`): per-document `{doc_id}.npy` (raw float32 vector bytes) and `{doc_id}.meta.json` ({doc_id, text}), plus two shared objects: `faiss.index` (serialized `IndexFlatL2`) and `index.ids.json` (a plain JSON list of doc_ids). The FAISS index has no id-awareness of its own — position `i` in the index is assumed to line up with position `i` in `index.ids.json`. That parallel-array coupling is load-bearing for every read.
+- **Add** (`add_document`): embeds text → uploads `.npy` + `.meta.json` → calls `_update_index(doc_id, vec)`, which downloads the current index+ids, `index.add()`s the one new vector, appends the id, re-uploads both the index and the ids list in full.
+- **Delete** (`delete_document`): removes the two per-doc objects, then unconditionally does a **full rebuild**: lists every `.npy` in the bucket, does a `GET` per object, `np.vstack`s them, rebuilds a fresh `IndexFlatL2`, re-uploads.
+- **Search** (`search_vectors`): downloads the index (lazily rebuilding once if missing), embeds the query, calls `index.search(qv, top_k)`, maps FAISS result positions back to ids via `ids[i]`.
+- **List** (`list_documents`): lists every `.meta.json` key in the bucket (no server-side pagination), sorts, then slices client-side by `skip`/`limit`.
+- **API** (`api/main.py`): thin FastAPI wrapper, one route per core function, a startup hook that calls `_update_index()` unconditionally.
+- **CLI** (`s3_vectors_at_home/cli.py`): argparse wrapper, same core calls, invoked via subprocess in `tests/test_cli.py`.
+- **Tests**: three files, all integration-style against a live MinIO (`docker-compose.yaml`) and the real embedding model — no mocking, no fixtures, no fast unit layer. `test_cli.py` shells out via `uv run s3_vectors_at_home.cli` per test (full Python startup + model load each time).
+- **CI** (`.github/workflows/ci.yaml`): `lint` (ruff) → `test` (docker compose up MinIO, `sleep 4`, pytest) and `build` (needs test+lint) → `publish` (on release, needs build).
+
+## Verified bugs (reproduced, not just read)
+
+1. **Search returns corrupted/duplicated results whenever `top_k` exceeds the number of indexed documents — CRITICAL, hits almost every small/fresh deployment.**
+   `vectorstore/core.py:86`: `return [ids[i] for i in Ind[0] if i < len(ids)]`. FAISS pads short result sets with sentinel index `-1` (confirmed live: `IndexFlatL2` with 2 vectors, `search(..., k=5)` → `I = [[0, 1, -1, -1, -1]]`). The filter `i < len(ids)` does **not** exclude `-1` (it's less than any positive length), so `ids[-1]` — Python's last-element wraparound — gets appended once per padding slot. Reproduced: with ids `['doc-a', 'doc-b']` and `top_k=5`, the function returns `['doc-a', 'doc-b', 'doc-b', 'doc-b', 'doc-b']`. This is not an edge case — it's the default CLI behavior (`--top-k` defaults to 5, README's own example uploads a single doc) any time the collection is smaller than `top_k`.
+   Fix: filter `i >= 0` (and also `i < len(ids)` for safety), not `i < len(ids)` alone.
+
+2. **The project does not currently install/run at all with a fresh `uv sync` — CRITICAL, root cause of the recurring "numpy issue" the README already band-aids.**
+   `pyproject.toml` hard-pins `torch==2.2.2` (Mar 2024) but leaves `sentence-transformers`/`transformers` unversioned. A clean `uv sync` today resolves `transformers==5.15.1` + `sentence-transformers==6.0.0`, whose import chain (`transformers/integrations/tensor_parallel.py:431`, `class _AllReduceBackward(torch.autograd.Function)`) hits `NameError: name 'torch' is not defined` — a version-guarded `torch` import elsewhere in that chain silently no-ops against torch 2.2.2's older API surface. Reproduced live: `import vectorstore.core` (and therefore the API, the CLI, and every test) crashes immediately with this traceback. `uv.lock` is **untracked** (shows as `??` in `git status`) — there is no committed lockfile pinning the resolution, so this will keep recurring/drifting as PyPI moves. The README's "install numpy first" gotcha and the `879a461 hitting that numpy runtime issue` commit are prior symptoms of the same underlying problem: an old hard pin (`torch`) plus unpinned fast-moving transitive deps (`transformers`), with nothing locking the combination.
+   Separately, `torch==2.2.2` with no `+cpu` variant/index constraint pulls the full CUDA wheel set (`nvidia-*-cu12`, hundreds of MB) even though the code hardcodes `device='cpu'` everywhere — unnecessary for a "run it at home" PoC.
+
+3. **CI's `build` job is broken and fails on every push/PR (it has no `if:` guard, so it always runs).**
+   `.github/workflows/ci.yaml`: `uvx run hatchling build`. Reproduced live: `uv`'s actual invocation is `uvx <tool> [args]` (alias for `uv tool run`) — there is no `run` subcommand under `uvx`. Running it literally: `Installed 1 package in 4ms` / `Package 'run' does not provide any executables.` The same broken line is duplicated in the `publish` job. Correct form is `uvx hatchling build` (or `uv build`).
+
+## Bugs found by reading (not independently reproduced, but code path is unambiguous)
+
+4. **Re-uploading an existing `doc_id` (i.e., "updating" a document) creates a stale duplicate entry in the search index, not an update.**
+   `add_document` always calls `_update_index(doc_id, vec)`. `_update_index`'s "index already exists" branch (`vectorstore/core.py:65-71`) unconditionally does `index.add(...)` + `ids.append(new_id)` — it never checks whether `new_id` is already present. The old vector for that doc_id stays in the FAISS index and stays searchable (under the doc's old text) forever, alongside the new one, until something triggers a full rebuild (e.g. an unrelated delete). `index.ids.json` ends up with duplicate entries for the same doc_id mapped to two different vectors — the parallel-array invariant (position `i` in FAISS ↔ position `i` in `ids`) is still technically intact, but the *document* invariant (one doc_id → one live vector) is broken.
+
+5. **Broad `except Exception: return None/pass` hides real infrastructure failures behind "not found."**
+   `get_document` (core.py:89-96) and `_download_index` (core.py:55-63) both catch *any* exception (MinIO down, network error, auth failure, corrupt object) and treat it identically to "doesn't exist." The API then reports a 404. A MinIO outage would look like every document was deleted, not like an outage — this will actively mislead whoever's debugging it.
+
+6. **MinIO response streams are never closed.** Every `client.get_object(...)` call (`core.py:40`, `57`, `60`, `92`) reads the body but never calls `.close()`/`.release_conn()`, which the `minio` SDK's own docs require to return the connection to the pool. Under sustained load this leaks connections.
+
+7. **`embedding_model_name()` almost certainly always returns `"unknown"`.** `core.py:151`: `getattr(embedder, "model_name", "unknown")` — `SentenceTransformer` instances don't expose a `model_name` attribute in current `sentence-transformers` versions (I could not execute this directly since bug #2 blocks all imports, but this matches the library's actual API surface). This is very likely why nobody's caught it: `tests/test_vectorstore.py::test_embedding_model_name` only asserts `len(name) > 0`, which `"unknown"` satisfies — a textbook case for a golden test with an exact expected value instead of a shape assertion.
+
+## Architectural decisions currently implicit (should become explicit, one way or another)
+
+- **Id tracking is a hand-rolled parallel array, not FAISS's own id support.** `IndexFlatL2` has no notion of ids; `index.ids.json`'s ordering is manually kept in lockstep with insertion order. `faiss.IndexIDMap2` (or `IndexIDMap`) lets FAISS own stable, explicit ids (e.g. a hash of doc_id) and supports `remove_ids`, which would also fix bug #4 (an update could `remove_ids` the old vector before adding the new one) and remove a whole class of "the array and the index disagreed" bugs.
+- **No concurrency control on the shared index.** `_update_index`'s download→mutate→upload of `faiss.index`/`index.ids.json` is a classic read-modify-write race with no lock and no optimistic concurrency (MinIO supports conditional writes via ETags, unused here). Two concurrent `add_document`/`delete_document` calls (which FastAPI will happily serve concurrently) can lose one writer's update. Worth an explicit decision: single-writer lock (e.g. via a MinIO lock object or an in-process `asyncio.Lock` if concurrency is only ever within one process), or accept it as a known PoC limitation.
+- **Eager, module-level side effects instead of lazy/injected clients.** Importing `vectorstore.core` requires live env vars + a reachable MinIO + a Hugging Face model download, unconditionally, at import time — not at app startup, not injectable. This is why tests can't run without real infra, why `python -c "import ..."` for tooling/linting purposes needs live services, and why CI must stand up MinIO before it can even *collect* tests. Moving to a factory function / FastAPI dependency + lazy-loaded model would decouple "can I import this code" from "is my infra up," which is also the prerequisite for fast unit tests and golden tests that don't need Docker.
+- **Full-rebuild-on-delete plus one-GET-per-vector reads.** `_load_all_vectors_and_ids` issues one MinIO GET per stored vector, serially, every time the index needs a full rebuild (any delete, or first search after index loss). Fine at PoC scale; an explicit decision is needed on whether "reimplement" means adding batched/concurrent fetch, `IndexIDMap.remove_ids` (avoids full rebuild entirely for deletes), or leaving it as a documented scaling limit.
+- **doc_id is used directly as an S3 object key with no validation.** Empty strings, `/`-containing ids (creates nested "directories" in the bucket namespace), or ids colliding with reserved names (`faiss.index`, `index.ids.json`) are all accepted uncritically by both API and CLI.
+
+## Test & CI/CD findings
+
+- **No unit tests are possible today** — every test in the repo talks to a live MinIO and a real embedding model (`tests/test_vectorstore.py`, `test_api.py`, and `test_cli.py`, the last of which shells out per-test via `uv run`, paying full Python + model-load startup cost each time). None of this is "golden" in the regression-fixture sense — assertions like `assert doc_id in matches` or `count_documents() >= 2` are shape checks, not exact-output checks, which is exactly why bug #1 (duplicate/-1 padding) and bug #7 (`"unknown"` model name) went uncaught.
+- **Shared mutable state across tests.** All tests share one `vectors` bucket with no isolation/teardown-per-test fixture; `test_count_documents_consistent` and the `>= 2` assertion in `test_list_documents_and_count_documents` read as workarounds for cross-test pollution rather than deliberate design.
+- **CI uses a fixed `sleep 4` to wait for MinIO** instead of polling a health check — flaky by construction on a loaded runner.
+- **CI's `build` job is broken** (see bug #3) and, independent of that fix, doesn't share its build artifact with `publish` via `actions/upload-artifact`/`download-artifact` — `publish` just re-runs the (currently broken) build command itself, duplicating work.
+- **No committed lockfile** (`uv.lock` is untracked) means CI's dependency resolution isn't reproducible run-to-run, which is the direct mechanism behind bug #2.
+
+## Minor / hygiene
+
+- **`.gitignore` contains leftover LLM-pasted markdown artifacts** — the file's actual content starts with `---`, `## 6. **.gitignore** (optional)`, and a ` ```gitignore ` fence marker before the real patterns. Functionally mostly harmless (git treats `##...` as a comment, `---` and the fence line as no-op literal-filename patterns), but it's a clear paste-without-cleanup artifact worth fixing while touching this area.
+
+## Cross-cutting pattern
+
+The common thread across almost every finding — the `-1`/duplicate search bug, the stale-index-on-update bug, the swallowed-exception bug, the flaky/broken CI — is **weak or absent verification at exactly the seams that matter**: tests assert shapes instead of exact values, exceptions are caught broadly instead of narrowly, and CI has no lockfile and no health-check gating. "Add golden tests and CI/CD" (as requested) directly targets this pattern: golden tests with fixed small corpora and exact expected result lists would have caught bugs #1, #4, and #7 immediately; a committed lockfile + fixed torch/transformers pin would have caught #2 before merge; and a working `build` job would have caught #3.
