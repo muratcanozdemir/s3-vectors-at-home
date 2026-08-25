@@ -1,51 +1,72 @@
 import argparse
-import sys
 import json
-from vectorstore.core import (
-    add_document, search_vectors, get_document, list_documents, delete_document, count_documents, embedding_model_name
-)
+import sys
+
+from vectorstore.core import get_store
+
 
 def cmd_upload(args):
-    add_document(args.doc_id, args.text)
+    try:
+        get_store().add_document(args.doc_id, args.text)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"Uploaded {args.doc_id}")
+
 
 def cmd_bulk_upload(args):
     with open(args.file, "r", encoding="utf-8") as f:
         docs = json.load(f)
     assert isinstance(docs, list), "Bulk file should be a JSON list of {doc_id, text}"
+    store = get_store()
     for doc in docs:
-        add_document(doc["doc_id"], doc["text"])
+        try:
+            store.add_document(doc["doc_id"], doc["text"])
+        except ValueError as e:
+            print(f"Error uploading {doc.get('doc_id')!r}: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"Uploaded {doc['doc_id']}")
     print(f"Bulk uploaded {len(docs)} documents.")
 
+
 def cmd_search(args):
-    results = search_vectors(args.query, args.top_k)
+    try:
+        results = get_store().search(args.query, args.top_k)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     print("Matches:", results)
 
+
 def cmd_get(args):
-    doc = get_document(args.doc_id)
+    doc = get_store().get_document(args.doc_id)
     if doc:
         print(json.dumps(doc, indent=2))
     else:
         print("Not found.", file=sys.stderr)
         sys.exit(1)
 
+
 def cmd_list(args):
-    docs = list_documents(skip=args.skip, limit=args.limit)
+    docs = get_store().list_documents(skip=args.skip, limit=args.limit)
     for d in docs:
-        print(d["doc_id"], "-", d["text_preview"].replace('\n', ' ')[:60])
+        print(d["doc_id"], "-", d["text_preview"].replace("\n", " ")[:60])
+
 
 def cmd_delete(args):
-    ok = delete_document(args.doc_id)
+    ok = get_store().delete_document(args.doc_id)
     if ok:
         print(f"Deleted {args.doc_id}")
     else:
         print("Not found or error.", file=sys.stderr)
         sys.exit(1)
 
+
 def cmd_status(args):
-    print(f"Documents: {count_documents()}")
-    print(f"Embedding model: {embedding_model_name()}")
+    store = get_store()
+    print(f"Documents: {store.count_documents()}")
+    print(f"Embedding model: {store.embedding_model_name()}")
+
 
 def main():
     ap = argparse.ArgumentParser(description="S3 Vectors at Home CLI")
@@ -83,6 +104,7 @@ def main():
 
     args = ap.parse_args()
     args.func(args)
+
 
 if __name__ == "__main__":
     main()

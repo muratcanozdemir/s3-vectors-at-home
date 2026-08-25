@@ -11,9 +11,9 @@ dependencies = [
     "minio",
     "faiss-cpu",
     "httpx",
-    "torch==2.2.2",
+    "torch>=2.4",
     "pydantic",
-    "sentence-transformers"
+    "sentence-transformers>=3.0"
 ]
 
 [build-system]
@@ -25,3 +25,11 @@ dev = ["pytest", "httpx", "pytest-cov"]
 
 [project.scripts]
 s3-vectors-cli = "s3_vectors_at_home.cli:main"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
