@@ -16,58 +16,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Lint that thing
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          uvx ruff check
+      - uses: astral-sh/setup-uv@v5
+      - name: Lint
+        run: uvx ruff check
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv sync --all-extras
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies (from committed lockfile)
+        run: uv sync --locked --all-extras
       - name: Start MinIO
-        run: |
-          docker compose -f minio/docker-compose.yaml up -d
-          sleep 4
-      - name: Set MinIO env
-        run: |
-          echo "MINIO_ENDPOINT=localhost:9000" >> $GITHUB_ENV
-          echo "MINIO_ACCESS_KEY=minioadmin" >> $GITHUB_ENV
-          echo "MINIO_SECRET_KEY=minioadmin123" >> $GITHUB_ENV
+        run: docker compose -f minio/docker-compose.yaml up -d
+      - name: Wait for MinIO to be ready
+        run: timeout 30 bash -c 'until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done'
       - name: Run tests
-        run: |
-          source .venv/bin/activate
-          pytest --cov
+        env:
+          MINIO_ENDPOINT: localhost:9000
+          MINIO_ACCESS_KEY: minioadmin
+          MINIO_SECRET_KEY: minioadmin123
+        run: uv run pytest --cov
 
   build:
     runs-on: ubuntu-latest
     needs: [test, lint]
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies and build
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv sync --all-extras dev
-          uvx run hatchling build
+      - uses: astral-sh/setup-uv@v5
+      - name: Build
+        run: uvx hatchling build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
   publish:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
-      - name: Create env, install and build
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          uv sync --all-extras
-          uvx run hatchling build
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@v5
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          uvx twine upload dist/*
+        run: uvx twine upload dist/*

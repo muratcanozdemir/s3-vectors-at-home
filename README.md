@@ -43,6 +43,16 @@ uvicorn api.main:app
 ### Status
 `s3-vectors-cli status`
 
+## Running tests
+```
+docker compose -f minio/docker-compose.yaml up -d
+export MINIO_ENDPOINT=localhost:9000
+export MINIO_ACCESS_KEY=minioadmin
+export MINIO_SECRET_KEY=minioadmin123
+uv sync --all-extras
+uv run pytest
+```
+`tests/test_vectorstore_golden.py` is fast and needs none of the above (fake MinIO client + fake embedder, no network); the rest are end-to-end sanity checks against the real MinIO + embedding model.
+
 # Contributing
-## Gotchas
-- Make sure you install numpy first. Huggingface apparently haven't addressed that issue with sentence-transformers needing a numpy lib first, so uv sync installs kinda fail.
+- Dependencies are locked (`uv.lock`, committed) and `torch` is pinned to the CPU wheel index (`tool.uv.sources` in `pyproject.toml`) so `uv sync` stays reproducible and doesn't pull CUDA packages nobody here needs.

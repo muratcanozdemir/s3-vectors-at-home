@@ -1,12 +1,10 @@
-
----
-
-## 6. **.gitignore** (optional)
-
-```gitignore
 __pycache__/
 *.pyc
 minio/data/
 *.db
 *.sqlite
 .env
+.venv/
+dist/
+.coverage
+.pytest_cache/

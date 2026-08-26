@@ -1,11 +1,12 @@
+import json
 import subprocess
 import uuid
-import json
+
 
 def run_cli(args):
     # Use subprocess so that sys.argv is handled properly
     result = subprocess.run(
-        ["uv", "run", "s3_vectors_at_home.cli"] + args,
+        ["uv", "run", "s3-vectors-cli"] + args,
         capture_output=True,
         text=True,
         check=True
