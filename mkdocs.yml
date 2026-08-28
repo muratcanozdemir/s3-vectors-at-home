@@ -1,0 +1,5 @@
+site_name: s3-vectors-at-home
+nav:
+  - Home: index.md
+plugins:
+  - techdocs-core
