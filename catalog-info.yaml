@@ -1,0 +1,13 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: s3-vectors-at-home
+  description: Self-hosted, from-scratch clone of AWS S3 Vectors — a vector database built by combining MinIO, FAISS, and FastAPI, with sentence-transformers handling embeddings.
+  tags: [python, service, cli, vector-database, faiss]
+  annotations:
+    github.com/project-slug: muratcanozdemir/s3-vectors-at-home
+    backstage.io/techdocs-ref: dir:.
+spec:
+  type: service
+  owner: user:default/muratcanozdemir
+  lifecycle: experimental
