@@ -307,3 +307,46 @@ def test_search_with_scores_is_cosine_similarity_sorted_desc(store):
 def test_search_matches_search_with_scores_order(store):
     store.add_documents([(f"d{i}", f"text {i}") for i in range(6)])
     assert store.search("text 3", top_k=4) == [r["doc_id"] for r in store.search_with_scores("text 3", top_k=4)]
+
+
+# -- performance-shaped behaviour -------------------------------------------
+
+
+def test_bulk_spanning_several_embed_chunks_keeps_ids_aligned(store, monkeypatch):
+    from vectorstore import core
+
+    monkeypatch.setattr(core, "EMBED_CHUNK_SIZE", 4)
+    docs = [(f"d{i}", f"text {i}") for i in range(11)]  # 3 chunks, last one partial
+    assert store.add_documents(docs) == 11
+    for i in (0, 3, 4, 7, 10):
+        assert store.search(f"text {i}", top_k=1) == [f"d{i}"]
+
+
+def test_list_and_count_read_the_cached_index_not_the_bucket():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_documents([("b", "beta"), ("a", "alpha"), ("c", "gamma")])
+    listed = []
+    real_list = client.list_objects
+    client.list_objects = lambda bucket: listed.append(bucket) or real_list(bucket)
+    assert store.count_documents() == 3
+    assert [d["doc_id"] for d in store.list_documents(skip=1, limit=5)] == ["b", "c"]
+    assert listed == []
+
+
+def test_upload_failure_in_bulk_leaves_index_untouched():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("keep", "kept text")
+    real_put = client.put_object
+
+    def flaky_put(bucket, key, data, length):
+        if key == "boom.meta.json":
+            raise RuntimeError("upload failed")
+        return real_put(bucket, key, data, length)
+
+    client.put_object = flaky_put
+    with pytest.raises(RuntimeError):
+        store.add_documents([("ok", "fine"), ("boom", "bad")])
+    assert store.search("fine", top_k=10) == ["keep"]
+    assert store.count_documents() == 1

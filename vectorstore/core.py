@@ -4,6 +4,7 @@ import json
 import os
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import faiss
 import numpy as np
@@ -27,6 +28,14 @@ RESERVED_OBJECT_NAMES = {INDEX_OBJ, *LEGACY_INDEX_OBJS}
 MAX_DOC_ID_LENGTH = 512
 MAX_TOP_K = 1000
 MAX_PAGE_SIZE = 1000
+# Object-store calls are network round trips, so independent ones (the
+# per-document objects of a bulk write, a page of metadata reads, the
+# vectors of a rebuild) run in parallel. Kept below minio-py's urllib3
+# pool size (10) so workers don't queue for connections.
+DEFAULT_IO_WORKERS = 8
+# Bulk writes embed this many texts at a time, uploading each chunk while
+# the next one is embedded (CPU-bound model work overlaps network I/O).
+EMBED_CHUNK_SIZE = 256
 
 
 class ObjectNotFoundError(Exception):
@@ -79,11 +88,12 @@ class VectorStore:
     thread mutates them.
     """
 
-    def __init__(self, client: Minio, embedder, bucket: str = BUCKET):
+    def __init__(self, client: Minio, embedder, bucket: str = BUCKET, io_workers: int = DEFAULT_IO_WORKERS):
         self._client = client
         self._embedder = embedder
         self._bucket = bucket
         self._lock = threading.Lock()
+        self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
         # (ids-object etag, index, id_map) or None
         self._cache: tuple[str, object, dict] | None = None
         self._ensure_bucket()
@@ -128,6 +138,10 @@ class VectorStore:
                 raise
         except ObjectNotFoundError:
             pass
+
+    def _parallel(self, fn, items) -> list:
+        """fn over items on the I/O pool, results in order; re-raises the first error."""
+        return list(self._io.map(fn, items))
 
     def _embed_many(self, texts: list[str]) -> np.ndarray:
         vecs = self._embedder.encode(texts, normalize_embeddings=True)
@@ -206,15 +220,16 @@ class VectorStore:
         """
         for legacy in LEGACY_INDEX_OBJS:
             self._delete_object(legacy)
-        vectors, doc_ids = [], []
-        for obj in self._client.list_objects(self._bucket):
-            if obj.object_name.endswith(".npy"):
-                doc_id = obj.object_name.removesuffix(".npy")
-                vec = np.frombuffer(self._get_bytes(obj.object_name), dtype=np.float32)
-                vectors.append(vec)
-                doc_ids.append(doc_id)
-        if not vectors:
+        doc_ids = [
+            obj.object_name.removesuffix(".npy")
+            for obj in self._client.list_objects(self._bucket)
+            if obj.object_name.endswith(".npy")
+        ]
+        if not doc_ids:
             return None, {}
+        vectors = self._parallel(
+            lambda d: np.frombuffer(self._get_bytes(f"{d}.npy"), dtype=np.float32), doc_ids
+        )
         dim = vectors[0].shape[0]
         index = faiss.IndexIDMap2(faiss.IndexFlatL2(dim))
         keys = np.array([object_key_id(d) for d in doc_ids], dtype="int64")
@@ -258,10 +273,20 @@ class VectorStore:
         if not batch:
             return 0
         doc_ids = list(batch)
-        vecs = self._embed_many([batch[d] for d in doc_ids])
-        for doc_id, vec in zip(doc_ids, vecs):
-            self._put_bytes(f"{doc_id}.npy", vec.tobytes())
-            self._put_bytes(f"{doc_id}.meta.json", json.dumps({"doc_id": doc_id, "text": batch[doc_id]}).encode())
+        # Embed chunk by chunk, handing each chunk's uploads to the I/O pool
+        # before embedding the next, so uploads overlap embedding.
+        chunks, uploads = [], []
+        for start in range(0, len(doc_ids), EMBED_CHUNK_SIZE):
+            chunk_ids = doc_ids[start: start + EMBED_CHUNK_SIZE]
+            chunk_vecs = self._embed_many([batch[d] for d in chunk_ids])
+            chunks.append(chunk_vecs)
+            for doc_id, vec in zip(chunk_ids, chunk_vecs):
+                meta = json.dumps({"doc_id": doc_id, "text": batch[doc_id]}).encode()
+                uploads.append(self._io.submit(self._put_bytes, f"{doc_id}.npy", vec.tobytes()))
+                uploads.append(self._io.submit(self._put_bytes, f"{doc_id}.meta.json", meta))
+        for f in uploads:
+            f.result()  # wait for all; re-raise the first failure before touching the index
+        vecs = np.vstack(chunks)
         keys = np.array([object_key_id(d) for d in doc_ids], dtype="int64")
         with self._lock:
             index, id_map = self._ensure_index(persist=False)
@@ -287,17 +312,15 @@ class VectorStore:
             raise ValueError("skip must not be negative")
         if not 0 <= limit <= MAX_PAGE_SIZE:
             raise ValueError(f"limit must be between 0 and {MAX_PAGE_SIZE}")
-        doc_ids = sorted(
-            obj.object_name.removesuffix(".meta.json")
-            for obj in self._client.list_objects(self._bucket)
-            if obj.object_name.endswith(".meta.json")
-        )
-        docs = []
-        for doc_id in doc_ids[skip: skip + limit]:
-            meta = self.get_document(doc_id)
-            if meta:
-                docs.append({"doc_id": doc_id, "text_preview": meta.get("text", "")[:64]})
-        return docs
+        # The (cached) index's id map is the list of searchable documents,
+        # so paging reads it instead of listing every object in the bucket.
+        page = sorted(self._indexed_doc_ids())[skip: skip + limit]
+        metas = self._parallel(self.get_document, page)
+        return [
+            {"doc_id": doc_id, "text_preview": meta.get("text", "")[:64]}
+            for doc_id, meta in zip(page, metas)
+            if meta
+        ]
 
     def delete_document(self, doc_id: str) -> bool:
         if self.get_document(doc_id) is None:
@@ -344,7 +367,12 @@ class VectorStore:
         ]
 
     def count_documents(self) -> int:
-        return sum(1 for obj in self._client.list_objects(self._bucket) if obj.object_name.endswith(".meta.json"))
+        return len(self._indexed_doc_ids())
+
+    def _indexed_doc_ids(self) -> list[str]:
+        with self._lock:
+            _, id_map = self._ensure_index()
+            return list(id_map.values())
 
     def embedding_model_name(self) -> str:
         return MODEL_NAME
