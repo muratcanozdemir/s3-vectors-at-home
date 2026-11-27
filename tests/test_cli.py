@@ -44,9 +44,16 @@ def test_cli_bulk_upload(tmp_path):
         run_cli(["delete", "--doc-id", d["doc_id"]])
 
 def test_cli_list_and_status():
-    # Just ensure these don't error out
-    out = run_cli(["list"])
-    assert "doc_id" in out or out == ""
+    # The old assertion ("doc_id" in out or out == "") only held for an
+    # empty bucket: list prints "<id> - <preview>", never the literal
+    # "doc_id". Assert on a doc we own instead.
+    doc_id = unique_id()
+    run_cli(["upload", "--doc-id", doc_id, "--text", "listed doc"])
+    try:
+        out = run_cli(["list", "--limit", "1000"])
+        assert f"{doc_id} - listed doc" in out
+    finally:
+        run_cli(["delete", "--doc-id", doc_id])
     out = run_cli(["status"])
     assert "Documents:" in out
     assert "Embedding model:" in out

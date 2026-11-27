@@ -43,6 +43,12 @@ uvicorn api.main:app
 ### Status
 `s3-vectors-cli status`
 
+## Behaviour worth knowing
+- **Bulk upload is all-or-nothing on validation.** Every `doc_id` is checked before anything is written, so one bad id rejects the whole batch (HTTP 400 / CLI exit 1) instead of leaving it half-applied. The batch is embedded in one call and the FAISS index is written once, not once per document. If a `doc_id` repeats within a batch, the last one wins.
+- **The index is cached in memory.** Searches don't download the index from MinIO each time; they do a cheap `HEAD` on `index.ids.json` and reload only if its ETag changed, so writes from other processes are still picked up.
+- **Limits.** `top_k` is 1–1000, `skip` ≥ 0, `limit` 0–1000; out-of-range values get HTTP 422.
+- **Single writer.** The index lock is per-process. Several API/CLI processes *reading* at once is fine, but concurrent *writes* from different processes can still lose an index update (the per-document `.npy`/`.meta.json` objects are kept, and the index rebuilds from them if it goes missing).
+
 ## Running tests
 ```
 docker compose -f minio/docker-compose.yaml up -d

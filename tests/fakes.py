@@ -13,6 +13,13 @@ import numpy as np
 from minio.error import S3Error
 
 _Object = namedtuple("Object", ["object_name"])
+_Stat = namedtuple("Stat", ["object_name", "etag"])
+_WriteResult = namedtuple("WriteResult", ["object_name", "etag"])
+
+
+def _etag(data: bytes) -> str:
+    # Matches what MinIO/S3 use for single-part uploads: the hex MD5.
+    return hashlib.md5(data).hexdigest()
 
 
 class FakeResponse:
@@ -47,6 +54,7 @@ class FakeMinioClient:
     def __init__(self):
         self.buckets = set()
         self.objects: dict[str, dict[str, bytes]] = {}
+        self.get_counts: dict[str, int] = {}
 
     def bucket_exists(self, bucket):
         return bucket in self.buckets
@@ -56,11 +64,20 @@ class FakeMinioClient:
         self.objects.setdefault(bucket, {})
 
     def put_object(self, bucket, key, data, length):
-        self.objects[bucket][key] = data.read()
+        payload = data.read()
+        self.objects[bucket][key] = payload
+        return _WriteResult(key, _etag(payload))
 
     def get_object(self, bucket, key):
+        self.get_counts[key] = self.get_counts.get(key, 0) + 1
         try:
             return FakeResponse(self.objects[bucket][key])
+        except KeyError:
+            raise _not_found(bucket, key)
+
+    def stat_object(self, bucket, key):
+        try:
+            return _Stat(key, _etag(self.objects[bucket][key]))
         except KeyError:
             raise _not_found(bucket, key)
 

@@ -13,7 +13,7 @@ import threading
 import pytest
 
 from tests.fakes import FakeEmbedder, FakeMinioClient
-from vectorstore.core import VectorStore
+from vectorstore.core import MAX_PAGE_SIZE, MAX_TOP_K, VectorStore
 
 
 @pytest.fixture
@@ -137,3 +137,106 @@ def test_concurrent_adds_all_land(store):
     results = store.search("text 0", top_k=20)
     assert len(results) == 20
     assert len(set(results)) == 20
+
+
+# -- batch writes ----------------------------------------------------------
+
+
+def test_add_documents_batch_is_searchable_and_counted(store):
+    assert store.add_documents([("a", "alpha"), ("b", "beta"), ("c", "gamma")]) == 3
+    assert store.count_documents() == 3
+    assert store.search("beta", top_k=1) == ["b"]
+    assert store.get_document("c") == {"doc_id": "c", "text": "gamma"}
+
+
+def test_add_documents_writes_index_once():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    puts = []
+    real_put = client.put_object
+
+    def counting_put(bucket, key, data, length):
+        puts.append(key)
+        return real_put(bucket, key, data, length)
+
+    client.put_object = counting_put
+    store.add_documents([(f"d{i}", f"text {i}") for i in range(10)])
+    assert puts.count("faiss.index") == 1
+    assert puts.count("index.ids.json") == 1
+
+
+def test_add_documents_rejects_whole_batch_on_invalid_id(store):
+    with pytest.raises(ValueError):
+        store.add_documents([("ok-1", "fine"), ("bad/id", "nope"), ("ok-2", "fine")])
+    # Validation happens before any write: nothing from the batch landed.
+    assert store.count_documents() == 0
+    assert store.search("fine", top_k=5) == []
+
+
+def test_add_documents_duplicate_ids_last_wins_single_entry(store):
+    store.add_documents([("x", "first"), ("x", "second")])
+    assert store.get_document("x")["text"] == "second"
+    assert store.search("second", top_k=10) == ["x"]
+
+
+def test_add_documents_replaces_existing_entries(store):
+    store.add_document("x", "old")
+    store.add_documents([("x", "new"), ("y", "other")])
+    results = store.search("new", top_k=10)
+    assert sorted(results) == ["x", "y"]
+    assert results[0] == "x"
+
+
+def test_add_documents_empty_batch_is_noop(store):
+    assert store.add_documents([]) == 0
+    assert store.search("anything", top_k=5) == []
+
+
+# -- index cache -----------------------------------------------------------
+
+
+def test_repeated_searches_do_not_redownload_index():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("doc-1", "cached text")
+    before = client.get_counts.get("faiss.index", 0)
+    for _ in range(5):
+        assert store.search("cached text", top_k=1) == ["doc-1"]
+    assert client.get_counts.get("faiss.index", 0) == before
+
+
+def test_cache_picks_up_writes_from_another_process():
+    # Two VectorStores over the same bucket stand in for two server
+    # processes: each has its own cache, coordinated only via the store.
+    client = FakeMinioClient()
+    writer = VectorStore(client, FakeEmbedder())
+    reader = VectorStore(client, FakeEmbedder())
+    writer.add_document("doc-1", "first")
+    assert reader.search("first", top_k=10) == ["doc-1"]
+    writer.add_document("doc-2", "second")
+    assert sorted(reader.search("second", top_k=10)) == ["doc-1", "doc-2"]
+    writer.delete_document("doc-1")
+    assert reader.search("first", top_k=10) == ["doc-2"]
+    writer.delete_document("doc-2")
+    assert reader.search("second", top_k=10) == []
+
+
+def test_index_rebuilt_when_index_objects_go_missing(store):
+    store.add_documents([("a", "alpha"), ("b", "beta")])
+    store._client.remove_object(store._bucket, "faiss.index")
+    store._client.remove_object(store._bucket, "index.ids.json")
+    assert sorted(store.search("alpha", top_k=10)) == ["a", "b"]
+
+
+# -- bounds ----------------------------------------------------------------
+
+
+def test_search_rejects_top_k_above_max(store):
+    with pytest.raises(ValueError):
+        store.search("text", top_k=MAX_TOP_K + 1)
+
+
+@pytest.mark.parametrize("skip,limit", [(-1, 10), (0, -1), (0, MAX_PAGE_SIZE + 1)])
+def test_list_documents_rejects_out_of_range_paging(store, skip, limit):
+    with pytest.raises(ValueError):
+        store.list_documents(skip=skip, limit=limit)
