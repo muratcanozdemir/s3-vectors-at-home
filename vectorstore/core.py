@@ -14,9 +14,9 @@ import numpy as np
 from minio.error import S3Error
 
 from minio import Minio
+from vectorstore.embedding import MODEL_NAME, OnnxEmbedder
 from vectorstore.filters import matches, validate_filter, validate_metadata
 
-MODEL_NAME = "all-MiniLM-L6-v2"
 BUCKET = "vectors"
 DEFAULT_INDEX = "default"
 MAX_DOC_ID_LENGTH = 512
@@ -678,8 +678,5 @@ def get_store() -> VectorStore:
                     secret_key=os.environ["MINIO_SECRET_KEY"],
                     secure=os.environ.get("MINIO_SECURE", "false").lower() == "true",
                 )
-                from sentence_transformers import SentenceTransformer
-
-                embedder = SentenceTransformer(MODEL_NAME, device="cpu")
-                _store = VectorStore(client, embedder)
+                _store = VectorStore(client, OnnxEmbedder.from_hub())
     return _store

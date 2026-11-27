@@ -92,4 +92,5 @@ uv run pytest
 `tests/test_vectorstore_golden.py` and `tests/test_filters.py` are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
 
 # Contributing
-- Dependencies are locked (`uv.lock`, committed) and `torch` is pinned to the CPU wheel index (`tool.uv.sources` in `pyproject.toml`) so `uv sync` stays reproducible and doesn't pull CUDA packages nobody here needs.
+- Dependencies are locked (`uv.lock`, committed), so `uv sync` stays reproducible.
+- Embeddings run on ONNX Runtime, with no PyTorch. `vectorstore/embedding.py` reproduces sentence-transformers' `all-MiniLM-L6-v2` pipeline from the model files, pinned to an exact Hugging Face revision. `tests/test_embedding.py` checks it against reference vectors made by sentence-transformers, so vectors stay compatible with ones stored earlier. To change the model or revision, update both `MODEL_REVISION` and the CI cache key, then regenerate the reference: `uv run --with sentence-transformers==6.0.0 python scripts/make_embedding_fixture.py`.
