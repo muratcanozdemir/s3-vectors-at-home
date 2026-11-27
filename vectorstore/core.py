@@ -316,7 +316,17 @@ class VectorStore:
                     self._save_index(index, id_map)
         return True
 
-    def search(self, query: str, top_k: int = 5):
+    def search(self, query: str, top_k: int = 5) -> list[str]:
+        """doc_ids of the top_k closest documents, closest first."""
+        return [r["doc_id"] for r in self.search_with_scores(query, top_k)]
+
+    def search_with_scores(self, query: str, top_k: int = 5) -> list[dict]:
+        """Top_k matches as [{"doc_id", "score"}], closest first.
+
+        `score` is cosine similarity (-1..1, higher is closer). Vectors are
+        unit-normalised, so it follows from FAISS's squared L2 distance d
+        as 1 - d/2 without changing the index type.
+        """
         if not 1 <= top_k <= MAX_TOP_K:
             raise ValueError(f"top_k must be between 1 and {MAX_TOP_K}")
         qv = self._embed(query)
@@ -324,10 +334,14 @@ class VectorStore:
             index, id_map = self._ensure_index()
             if index is None:
                 return []
-            _, result_ids = index.search(np.expand_dims(qv, axis=0), top_k)
+            distances, result_ids = index.search(np.expand_dims(qv, axis=0), top_k)
         # FAISS pads short result sets with sentinel id -1; must be excluded
         # explicitly or it aliases to the last id_map entry looked up.
-        return [id_map[int(i)] for i in result_ids[0] if i != -1]
+        return [
+            {"doc_id": id_map[int(i)], "score": float(1.0 - d / 2.0)}
+            for d, i in zip(distances[0], result_ids[0])
+            if i != -1
+        ]
 
     def count_documents(self) -> int:
         return sum(1 for obj in self._client.list_objects(self._bucket) if obj.object_name.endswith(".meta.json"))

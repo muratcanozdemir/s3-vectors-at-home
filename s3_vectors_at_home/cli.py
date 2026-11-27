@@ -31,12 +31,20 @@ def cmd_bulk_upload(args):
 
 
 def cmd_search(args):
+    store = get_store()
     try:
-        results = get_store().search(args.query, args.top_k)
+        if args.scores:
+            results = store.search_with_scores(args.query, args.top_k)
+        else:
+            results = store.search(args.query, args.top_k)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    print("Matches:", results)
+    if args.scores:
+        for r in results:
+            print(f"{r['score']:.4f}  {r['doc_id']}")
+    else:
+        print("Matches:", results)
 
 
 def cmd_get(args):
@@ -89,6 +97,7 @@ def main():
     s = subp.add_parser("search", help="Search for docs by text query")
     s.add_argument("--query", required=True)
     s.add_argument("--top-k", type=int, default=5)
+    s.add_argument("--scores", action="store_true", help="Print one 'score  doc_id' line per match")
     s.set_defaults(func=cmd_search)
 
     g = subp.add_parser("get", help="Get a document by id")

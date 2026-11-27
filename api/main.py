@@ -61,10 +61,12 @@ def delete_doc(doc_id: str):
 @app.post("/search")
 def search(req: SearchRequest):
     try:
-        results = get_store().search(req.query, req.top_k)
+        results = get_store().search_with_scores(req.query, req.top_k)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"matches": results}
+    # `matches` (bare doc_ids) is kept as-is for existing clients; `results`
+    # adds the cosine-similarity score per match.
+    return {"matches": [r["doc_id"] for r in results], "results": results}
 
 
 @app.get("/status")

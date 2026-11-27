@@ -278,3 +278,32 @@ def test_unrecognised_index_blob_is_an_error(store):
     fresh = VectorStore(store._client, FakeEmbedder())
     with pytest.raises(ValueError):
         fresh.search("alpha", top_k=1)
+
+
+# -- scores ----------------------------------------------------------------
+
+
+def test_search_with_scores_exact_match_scores_one(store):
+    store.add_documents([("a", "alpha"), ("b", "beta")])
+    results = store.search_with_scores("alpha", top_k=2)
+    assert results[0]["doc_id"] == "a"
+    assert results[0]["score"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_search_with_scores_is_cosine_similarity_sorted_desc(store):
+    import numpy as np
+
+    texts = {"a": "alpha", "b": "beta", "c": "gamma"}
+    store.add_documents(texts.items())
+    emb = FakeEmbedder()
+    q = emb.encode(["query"])[0]
+    expected = {d: float(np.dot(q, emb.encode([t])[0])) for d, t in texts.items()}
+    results = store.search_with_scores("query", top_k=3)
+    assert [r["score"] for r in results] == sorted((r["score"] for r in results), reverse=True)
+    for r in results:
+        assert r["score"] == pytest.approx(expected[r["doc_id"]], abs=1e-5)
+
+
+def test_search_matches_search_with_scores_order(store):
+    store.add_documents([(f"d{i}", f"text {i}") for i in range(6)])
+    assert store.search("text 3", top_k=4) == [r["doc_id"] for r in store.search_with_scores("text 3", top_k=4)]

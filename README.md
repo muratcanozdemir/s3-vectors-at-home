@@ -31,6 +31,8 @@ uvicorn api.main:app
 ### Search
 `s3-vectors-cli search --query "my search text" --top-k 3`
 
+Add `--scores` to print `score  doc_id` per match. Over HTTP, `POST /search` returns `matches` (doc_ids, closest first) and `results` (`[{"doc_id", "score"}]`), where `score` is cosine similarity (−1…1, higher is closer).
+
 ### Get doc
 `s3-vectors-cli get --doc-id foo`
 

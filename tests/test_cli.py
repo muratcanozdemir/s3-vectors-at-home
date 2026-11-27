@@ -25,6 +25,10 @@ def test_cli_upload_and_search(tmp_path):
     out = run_cli(["search", "--query", text, "--top-k", "1"])
     assert doc_id in out
 
+    out = run_cli(["search", "--query", text, "--top-k", "1", "--scores"])
+    score, listed_id = out.splitlines()[-1].split()
+    assert listed_id == doc_id and float(score) > 0.99
+
     out = run_cli(["get", "--doc-id", doc_id])
     assert doc_id in out and text in out
 
