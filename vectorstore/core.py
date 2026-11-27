@@ -2,7 +2,9 @@ import hashlib
 import io
 import json
 import os
+import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import faiss
 import numpy as np
@@ -12,12 +14,28 @@ from minio import Minio
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 BUCKET = "vectors"
-INDEX_OBJ = "faiss.index"
-IDS_OBJ = "index.ids.json"
-RESERVED_OBJECT_NAMES = {INDEX_OBJ, IDS_OBJ}
+# The FAISS index and its {int id: doc_id} map live in ONE object, so a
+# single PUT replaces both atomically. (They used to be two objects,
+# written one after the other: a crash or a concurrent writer in between
+# could leave an index whose ids the map didn't match.)
+INDEX_OBJ = "index.v2.bin"
+INDEX_MAGIC = b"S3VAH-IDX\x01"
+# Pre-v2 layout. Never read: a bucket that only has these has no INDEX_OBJ,
+# so the index is rebuilt from the per-document vectors and these are
+# removed. Kept reserved so no doc_id can collide with them.
+LEGACY_INDEX_OBJS = ("faiss.index", "index.ids.json")
+RESERVED_OBJECT_NAMES = {INDEX_OBJ, *LEGACY_INDEX_OBJS}
 MAX_DOC_ID_LENGTH = 512
 MAX_TOP_K = 1000
 MAX_PAGE_SIZE = 1000
+# Object-store calls are network round trips, so independent ones (the
+# per-document objects of a bulk write, a page of metadata reads, the
+# vectors of a rebuild) run in parallel. Kept below minio-py's urllib3
+# pool size (10) so workers don't queue for connections.
+DEFAULT_IO_WORKERS = 8
+# Bulk writes embed this many texts at a time, uploading each chunk while
+# the next one is embedded (CPU-bound model work overlaps network I/O).
+EMBED_CHUNK_SIZE = 256
 
 
 class ObjectNotFoundError(Exception):
@@ -61,8 +79,8 @@ class VectorStore:
     via `add_with_ids`/`remove_ids` -- no full rebuild needed except to
     bootstrap a missing index from the individually-stored vectors.
 
-    The loaded index is cached in memory, keyed by the ETag of the ids
-    object (always written last by `_save_index`). Each read does a cheap
+    The loaded index is cached in memory, keyed by the ETag of the index
+    object. Each read does a cheap
     HEAD (`stat_object`) instead of downloading the whole index; if another
     process has rewritten the index since, the ETag differs and it is
     reloaded. All access to the cached FAISS object happens under
@@ -70,11 +88,12 @@ class VectorStore:
     thread mutates them.
     """
 
-    def __init__(self, client: Minio, embedder, bucket: str = BUCKET):
+    def __init__(self, client: Minio, embedder, bucket: str = BUCKET, io_workers: int = DEFAULT_IO_WORKERS):
         self._client = client
         self._embedder = embedder
         self._bucket = bucket
         self._lock = threading.Lock()
+        self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
         # (ids-object etag, index, id_map) or None
         self._cache: tuple[str, object, dict] | None = None
         self._ensure_bucket()
@@ -120,6 +139,10 @@ class VectorStore:
         except ObjectNotFoundError:
             pass
 
+    def _parallel(self, fn, items) -> list:
+        """fn over items on the I/O pool, results in order; re-raises the first error."""
+        return list(self._io.map(fn, items))
+
     def _embed_many(self, texts: list[str]) -> np.ndarray:
         vecs = self._embedder.encode(texts, normalize_embeddings=True)
         return np.asarray(vecs, dtype=np.float32).reshape(len(texts), -1)
@@ -128,33 +151,50 @@ class VectorStore:
         return self._embed_many([text])[0]
 
     # -- index persistence ------------------------------------------------
-    # faiss.write_index/read_index require a path/FILE*/IOWriter, not a
-    # plain file-like object -- serialize_index/deserialize_index are the
-    # supported way to round-trip an index through an in-memory buffer.
+    # Blob layout: INDEX_MAGIC | u64 big-endian length of ids JSON | ids JSON
+    # | faiss.serialize_index bytes. faiss.write_index/read_index need a
+    # path/FILE*/IOWriter, not a file-like object -- serialize_index /
+    # deserialize_index are the supported in-memory round trip.
+
+    @staticmethod
+    def _encode_index(index, id_map: dict) -> bytes:
+        ids_json = json.dumps({str(k): v for k, v in id_map.items()}).encode()
+        return b"".join(
+            (INDEX_MAGIC, struct.pack(">Q", len(ids_json)), ids_json, faiss.serialize_index(index).tobytes())
+        )
+
+    @staticmethod
+    def _decode_index(blob: bytes):
+        if not blob.startswith(INDEX_MAGIC):
+            raise ValueError(f"{INDEX_OBJ} is not a recognised index blob")
+        pos = len(INDEX_MAGIC)
+        (ids_len,) = struct.unpack_from(">Q", blob, pos)
+        pos += 8
+        id_map = {int(k): v for k, v in json.loads(blob[pos: pos + ids_len]).items()}
+        index = faiss.deserialize_index(np.frombuffer(blob, dtype=np.uint8, offset=pos + ids_len))
+        return index, id_map
 
     def _load_index(self):
         """Returns (IndexIDMap2 or None, {int_id: doc_id}).
 
         Must be called with `self._lock` held. Serves the cached index when
-        the ids object's ETag is unchanged. The ETag is read *before* the
+        the index object's ETag is unchanged. The ETag is read *before* the
         download, so a concurrent writer in another process can only cause
         newer data to be cached under an older ETag -- which just triggers
         one extra reload next time, never a stale read.
         """
-        etag = self._etag(IDS_OBJ)
+        etag = self._etag(INDEX_OBJ)
         if etag is None:
             self._cache = None
             return None, {}
         if self._cache is not None and self._cache[0] == etag:
             return self._cache[1], self._cache[2]
         try:
-            idx_bytes = self._get_bytes(INDEX_OBJ)
-            ids_bytes = self._get_bytes(IDS_OBJ)
+            blob = self._get_bytes(INDEX_OBJ)
         except ObjectNotFoundError:
             self._cache = None
             return None, {}
-        index = faiss.deserialize_index(np.frombuffer(idx_bytes, dtype=np.uint8))
-        id_map = {int(k): v for k, v in json.loads(ids_bytes).items()}
+        index, id_map = self._decode_index(blob)
         self._cache = (etag, index, id_map)
         return index, id_map
 
@@ -163,31 +203,33 @@ class VectorStore:
         # if a write below fails the cache must not keep serving the
         # mutated-but-unpersisted index as if it matched the stored ETag.
         self._cache = None
-        self._put_bytes(INDEX_OBJ, faiss.serialize_index(index).tobytes())
-        etag = self._put_bytes(IDS_OBJ, json.dumps({str(k): v for k, v in id_map.items()}).encode())
+        etag = self._put_bytes(INDEX_OBJ, self._encode_index(index, id_map))
         self._cache = (etag, index, id_map)
 
     def _drop_index(self):
         self._cache = None
         self._delete_object(INDEX_OBJ)
-        self._delete_object(IDS_OBJ)
 
     def _rebuild_index_from_scratch(self, persist: bool = True):
         """Bootstrap the index from the individually-stored vectors.
 
-        Only used when no index exists yet (first write, or a previous
-        index/ids object went missing) -- ordinary add/update/delete mutate
-        the existing index directly instead of paying for this.
+        Only used when no index exists yet (first write, a bucket still on
+        the pre-v2 two-object layout, or the index object went missing) --
+        ordinary add/update/delete mutate the existing index directly
+        instead of paying for this.
         """
-        vectors, doc_ids = [], []
-        for obj in self._client.list_objects(self._bucket):
-            if obj.object_name.endswith(".npy"):
-                doc_id = obj.object_name.removesuffix(".npy")
-                vec = np.frombuffer(self._get_bytes(obj.object_name), dtype=np.float32)
-                vectors.append(vec)
-                doc_ids.append(doc_id)
-        if not vectors:
+        for legacy in LEGACY_INDEX_OBJS:
+            self._delete_object(legacy)
+        doc_ids = [
+            obj.object_name.removesuffix(".npy")
+            for obj in self._client.list_objects(self._bucket)
+            if obj.object_name.endswith(".npy")
+        ]
+        if not doc_ids:
             return None, {}
+        vectors = self._parallel(
+            lambda d: np.frombuffer(self._get_bytes(f"{d}.npy"), dtype=np.float32), doc_ids
+        )
         dim = vectors[0].shape[0]
         index = faiss.IndexIDMap2(faiss.IndexFlatL2(dim))
         keys = np.array([object_key_id(d) for d in doc_ids], dtype="int64")
@@ -231,10 +273,20 @@ class VectorStore:
         if not batch:
             return 0
         doc_ids = list(batch)
-        vecs = self._embed_many([batch[d] for d in doc_ids])
-        for doc_id, vec in zip(doc_ids, vecs):
-            self._put_bytes(f"{doc_id}.npy", vec.tobytes())
-            self._put_bytes(f"{doc_id}.meta.json", json.dumps({"doc_id": doc_id, "text": batch[doc_id]}).encode())
+        # Embed chunk by chunk, handing each chunk's uploads to the I/O pool
+        # before embedding the next, so uploads overlap embedding.
+        chunks, uploads = [], []
+        for start in range(0, len(doc_ids), EMBED_CHUNK_SIZE):
+            chunk_ids = doc_ids[start: start + EMBED_CHUNK_SIZE]
+            chunk_vecs = self._embed_many([batch[d] for d in chunk_ids])
+            chunks.append(chunk_vecs)
+            for doc_id, vec in zip(chunk_ids, chunk_vecs):
+                meta = json.dumps({"doc_id": doc_id, "text": batch[doc_id]}).encode()
+                uploads.append(self._io.submit(self._put_bytes, f"{doc_id}.npy", vec.tobytes()))
+                uploads.append(self._io.submit(self._put_bytes, f"{doc_id}.meta.json", meta))
+        for f in uploads:
+            f.result()  # wait for all; re-raise the first failure before touching the index
+        vecs = np.vstack(chunks)
         keys = np.array([object_key_id(d) for d in doc_ids], dtype="int64")
         with self._lock:
             index, id_map = self._ensure_index(persist=False)
@@ -260,17 +312,15 @@ class VectorStore:
             raise ValueError("skip must not be negative")
         if not 0 <= limit <= MAX_PAGE_SIZE:
             raise ValueError(f"limit must be between 0 and {MAX_PAGE_SIZE}")
-        doc_ids = sorted(
-            obj.object_name.removesuffix(".meta.json")
-            for obj in self._client.list_objects(self._bucket)
-            if obj.object_name.endswith(".meta.json")
-        )
-        docs = []
-        for doc_id in doc_ids[skip: skip + limit]:
-            meta = self.get_document(doc_id)
-            if meta:
-                docs.append({"doc_id": doc_id, "text_preview": meta.get("text", "")[:64]})
-        return docs
+        # The (cached) index's id map is the list of searchable documents,
+        # so paging reads it instead of listing every object in the bucket.
+        page = sorted(self._indexed_doc_ids())[skip: skip + limit]
+        metas = self._parallel(self.get_document, page)
+        return [
+            {"doc_id": doc_id, "text_preview": meta.get("text", "")[:64]}
+            for doc_id, meta in zip(page, metas)
+            if meta
+        ]
 
     def delete_document(self, doc_id: str) -> bool:
         if self.get_document(doc_id) is None:
@@ -289,7 +339,17 @@ class VectorStore:
                     self._save_index(index, id_map)
         return True
 
-    def search(self, query: str, top_k: int = 5):
+    def search(self, query: str, top_k: int = 5) -> list[str]:
+        """doc_ids of the top_k closest documents, closest first."""
+        return [r["doc_id"] for r in self.search_with_scores(query, top_k)]
+
+    def search_with_scores(self, query: str, top_k: int = 5) -> list[dict]:
+        """Top_k matches as [{"doc_id", "score"}], closest first.
+
+        `score` is cosine similarity (-1..1, higher is closer). Vectors are
+        unit-normalised, so it follows from FAISS's squared L2 distance d
+        as 1 - d/2 without changing the index type.
+        """
         if not 1 <= top_k <= MAX_TOP_K:
             raise ValueError(f"top_k must be between 1 and {MAX_TOP_K}")
         qv = self._embed(query)
@@ -297,13 +357,22 @@ class VectorStore:
             index, id_map = self._ensure_index()
             if index is None:
                 return []
-            _, result_ids = index.search(np.expand_dims(qv, axis=0), top_k)
+            distances, result_ids = index.search(np.expand_dims(qv, axis=0), top_k)
         # FAISS pads short result sets with sentinel id -1; must be excluded
         # explicitly or it aliases to the last id_map entry looked up.
-        return [id_map[int(i)] for i in result_ids[0] if i != -1]
+        return [
+            {"doc_id": id_map[int(i)], "score": float(1.0 - d / 2.0)}
+            for d, i in zip(distances[0], result_ids[0])
+            if i != -1
+        ]
 
     def count_documents(self) -> int:
-        return sum(1 for obj in self._client.list_objects(self._bucket) if obj.object_name.endswith(".meta.json"))
+        return len(self._indexed_doc_ids())
+
+    def _indexed_doc_ids(self) -> list[str]:
+        with self._lock:
+            _, id_map = self._ensure_index()
+            return list(id_map.values())
 
     def embedding_model_name(self) -> str:
         return MODEL_NAME

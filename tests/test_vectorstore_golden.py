@@ -13,7 +13,7 @@ import threading
 import pytest
 
 from tests.fakes import FakeEmbedder, FakeMinioClient
-from vectorstore.core import MAX_PAGE_SIZE, MAX_TOP_K, VectorStore
+from vectorstore.core import INDEX_OBJ, MAX_PAGE_SIZE, MAX_TOP_K, VectorStore
 
 
 @pytest.fixture
@@ -108,7 +108,7 @@ def test_embedding_model_name_is_exact(store):
 
 @pytest.mark.parametrize(
     "bad_doc_id",
-    ["", "has/slash", "faiss.index", "index.ids.json", "x" * 513],
+    ["", "has/slash", "index.v2.bin", "faiss.index", "index.ids.json", "x" * 513],
 )
 def test_add_document_rejects_invalid_doc_id(store, bad_doc_id):
     with pytest.raises(ValueError):
@@ -161,8 +161,7 @@ def test_add_documents_writes_index_once():
 
     client.put_object = counting_put
     store.add_documents([(f"d{i}", f"text {i}") for i in range(10)])
-    assert puts.count("faiss.index") == 1
-    assert puts.count("index.ids.json") == 1
+    assert puts.count(INDEX_OBJ) == 1
 
 
 def test_add_documents_rejects_whole_batch_on_invalid_id(store):
@@ -199,10 +198,10 @@ def test_repeated_searches_do_not_redownload_index():
     client = FakeMinioClient()
     store = VectorStore(client, FakeEmbedder())
     store.add_document("doc-1", "cached text")
-    before = client.get_counts.get("faiss.index", 0)
+    before = client.get_counts.get(INDEX_OBJ, 0)
     for _ in range(5):
         assert store.search("cached text", top_k=1) == ["doc-1"]
-    assert client.get_counts.get("faiss.index", 0) == before
+    assert client.get_counts.get(INDEX_OBJ, 0) == before
 
 
 def test_cache_picks_up_writes_from_another_process():
@@ -223,8 +222,7 @@ def test_cache_picks_up_writes_from_another_process():
 
 def test_index_rebuilt_when_index_objects_go_missing(store):
     store.add_documents([("a", "alpha"), ("b", "beta")])
-    store._client.remove_object(store._bucket, "faiss.index")
-    store._client.remove_object(store._bucket, "index.ids.json")
+    store._client.remove_object(store._bucket, INDEX_OBJ)
     assert sorted(store.search("alpha", top_k=10)) == ["a", "b"]
 
 
@@ -240,3 +238,115 @@ def test_search_rejects_top_k_above_max(store):
 def test_list_documents_rejects_out_of_range_paging(store, skip, limit):
     with pytest.raises(ValueError):
         store.list_documents(skip=skip, limit=limit)
+
+
+# -- index format ----------------------------------------------------------
+
+
+def test_index_is_a_single_object(store):
+    store.add_documents([("a", "alpha"), ("b", "beta")])
+    names = set(store._client.objects[store._bucket])
+    assert INDEX_OBJ in names
+    assert not names & {"faiss.index", "index.ids.json"}
+
+
+def test_index_blob_round_trips(store):
+    store.add_documents([("a", "alpha"), ("b", "beta")])
+    blob = store._client.objects[store._bucket][INDEX_OBJ]
+    index, id_map = VectorStore._decode_index(blob)
+    assert index.ntotal == 2
+    assert sorted(id_map.values()) == ["a", "b"]
+
+
+def test_legacy_two_object_layout_is_migrated(store):
+    # A bucket written by the pre-v2 code: per-doc objects plus the old
+    # faiss.index / index.ids.json pair, and no index.v2.bin.
+    store.add_documents([("a", "alpha"), ("b", "beta")])
+    objects = store._client.objects[store._bucket]
+    del objects[INDEX_OBJ]
+    objects["faiss.index"] = b"legacy"
+    objects["index.ids.json"] = b"{}"
+    fresh = VectorStore(store._client, FakeEmbedder())
+    assert fresh.search("alpha", top_k=1) == ["a"]
+    assert INDEX_OBJ in objects
+    assert "faiss.index" not in objects and "index.ids.json" not in objects
+
+
+def test_unrecognised_index_blob_is_an_error(store):
+    store.add_document("a", "alpha")
+    store._client.objects[store._bucket][INDEX_OBJ] = b"garbage"
+    fresh = VectorStore(store._client, FakeEmbedder())
+    with pytest.raises(ValueError):
+        fresh.search("alpha", top_k=1)
+
+
+# -- scores ----------------------------------------------------------------
+
+
+def test_search_with_scores_exact_match_scores_one(store):
+    store.add_documents([("a", "alpha"), ("b", "beta")])
+    results = store.search_with_scores("alpha", top_k=2)
+    assert results[0]["doc_id"] == "a"
+    assert results[0]["score"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_search_with_scores_is_cosine_similarity_sorted_desc(store):
+    import numpy as np
+
+    texts = {"a": "alpha", "b": "beta", "c": "gamma"}
+    store.add_documents(texts.items())
+    emb = FakeEmbedder()
+    q = emb.encode(["query"])[0]
+    expected = {d: float(np.dot(q, emb.encode([t])[0])) for d, t in texts.items()}
+    results = store.search_with_scores("query", top_k=3)
+    assert [r["score"] for r in results] == sorted((r["score"] for r in results), reverse=True)
+    for r in results:
+        assert r["score"] == pytest.approx(expected[r["doc_id"]], abs=1e-5)
+
+
+def test_search_matches_search_with_scores_order(store):
+    store.add_documents([(f"d{i}", f"text {i}") for i in range(6)])
+    assert store.search("text 3", top_k=4) == [r["doc_id"] for r in store.search_with_scores("text 3", top_k=4)]
+
+
+# -- performance-shaped behaviour -------------------------------------------
+
+
+def test_bulk_spanning_several_embed_chunks_keeps_ids_aligned(store, monkeypatch):
+    from vectorstore import core
+
+    monkeypatch.setattr(core, "EMBED_CHUNK_SIZE", 4)
+    docs = [(f"d{i}", f"text {i}") for i in range(11)]  # 3 chunks, last one partial
+    assert store.add_documents(docs) == 11
+    for i in (0, 3, 4, 7, 10):
+        assert store.search(f"text {i}", top_k=1) == [f"d{i}"]
+
+
+def test_list_and_count_read_the_cached_index_not_the_bucket():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_documents([("b", "beta"), ("a", "alpha"), ("c", "gamma")])
+    listed = []
+    real_list = client.list_objects
+    client.list_objects = lambda bucket: listed.append(bucket) or real_list(bucket)
+    assert store.count_documents() == 3
+    assert [d["doc_id"] for d in store.list_documents(skip=1, limit=5)] == ["b", "c"]
+    assert listed == []
+
+
+def test_upload_failure_in_bulk_leaves_index_untouched():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("keep", "kept text")
+    real_put = client.put_object
+
+    def flaky_put(bucket, key, data, length):
+        if key == "boom.meta.json":
+            raise RuntimeError("upload failed")
+        return real_put(bucket, key, data, length)
+
+    client.put_object = flaky_put
+    with pytest.raises(RuntimeError):
+        store.add_documents([("ok", "fine"), ("boom", "bad")])
+    assert store.search("fine", top_k=10) == ["keep"]
+    assert store.count_documents() == 1

@@ -22,6 +22,9 @@ def test_upload_and_search_and_delete():
     assert search_r.status_code == 200
     matches = search_r.json()["matches"]
     assert doc_id in matches
+    results = search_r.json()["results"]
+    assert [r["doc_id"] for r in results] == matches
+    assert all(-1.0 <= r["score"] <= 1.0 for r in results)
     # Get doc
     get_r = client.get(f"/document/{doc_id}")
     assert get_r.status_code == 200
