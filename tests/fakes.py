@@ -7,6 +7,7 @@ validation) in isolation from MinIO and the real embedding model.
 """
 
 import hashlib
+import threading
 from collections import namedtuple
 
 import numpy as np
@@ -26,6 +27,7 @@ class FakeResponse:
     def __init__(self, data: bytes):
         self._data = data
         self.closed = False
+        self.headers = {"ETag": f'"{_etag(data)}"'}
 
     def read(self):
         return self._data
@@ -37,24 +39,36 @@ class FakeResponse:
         pass
 
 
-def _not_found(bucket: str, key: str) -> S3Error:
+def _s3_error(code: str, bucket: str, key: str) -> S3Error:
     return S3Error(
         response=None,
-        code="NoSuchKey",
-        message="not found",
+        code=code,
+        message=code,
         resource=f"/{bucket}/{key}",
         request_id="fake-request-id",
         host_id="fake-host-id",
     )
 
 
-class FakeMinioClient:
-    """Implements the small subset of the Minio client surface VectorStore uses."""
+def _not_found(bucket: str, key: str) -> S3Error:
+    return _s3_error("NoSuchKey", bucket, key)
 
-    def __init__(self):
+
+class FakeMinioClient:
+    """Implements the small subset of the Minio client surface VectorStore uses.
+
+    `_put_object` enforces If-Match / If-None-Match atomically, with the
+    error codes MinIO returns (checked against a real server: 412
+    PreconditionFailed, and NoSuchKey for If-Match on a missing key).
+    `enforce_conditions=False` imitates a server that ignores them.
+    """
+
+    def __init__(self, enforce_conditions: bool = True):
         self.buckets = set()
         self.objects: dict[str, dict[str, bytes]] = {}
         self.get_counts: dict[str, int] = {}
+        self.enforce_conditions = enforce_conditions
+        self._write_lock = threading.Lock()
 
     def bucket_exists(self, bucket):
         return bucket in self.buckets
@@ -65,7 +79,24 @@ class FakeMinioClient:
 
     def put_object(self, bucket, key, data, length):
         payload = data.read()
-        self.objects[bucket][key] = payload
+        with self._write_lock:
+            self.objects[bucket][key] = payload
+        return _WriteResult(key, _etag(payload))
+
+    def _put_object(self, bucket, key, data, headers):
+        payload = bytes(data)
+        with self._write_lock:
+            if self.enforce_conditions:
+                current = self.objects[bucket].get(key)
+                if_match = headers.get("If-Match")
+                if headers.get("If-None-Match") == "*" and current is not None:
+                    raise _s3_error("PreconditionFailed", bucket, key)
+                if if_match is not None:
+                    if current is None:
+                        raise _not_found(bucket, key)
+                    if if_match.strip('"') != _etag(current):
+                        raise _s3_error("PreconditionFailed", bucket, key)
+            self.objects[bucket][key] = payload
         return _WriteResult(key, _etag(payload))
 
     def get_object(self, bucket, key):
@@ -83,7 +114,8 @@ class FakeMinioClient:
 
     def remove_object(self, bucket, key):
         try:
-            del self.objects[bucket][key]
+            with self._write_lock:
+                del self.objects[bucket][key]
         except KeyError:
             raise _not_found(bucket, key)
 

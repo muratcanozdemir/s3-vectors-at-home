@@ -1,9 +1,15 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from vectorstore.core import MAX_PAGE_SIZE, MAX_TOP_K, get_store
+from vectorstore.core import (
+    MAX_PAGE_SIZE,
+    MAX_TOP_K,
+    IndexWriteConflictError,
+    get_store,
+)
 
 
 @asynccontextmanager
@@ -16,6 +22,13 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(IndexWriteConflictError)
+def index_write_conflict(_request: Request, exc: IndexWriteConflictError):
+    # Contention, not a bad request: nothing was half-applied and the same
+    # request can simply be sent again.
+    return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "1"})
 
 
 class DocUpload(BaseModel):
