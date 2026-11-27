@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # The MinIO image is pinned by digest in the compose file; this proposes
+  # bumps when Chainguard publishes a new `latest`. CI runs the full suite
+  # (conditional-write probe and multi-process tests included) on each.
+  - package-ecosystem: docker-compose
+    directory: /minio
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
