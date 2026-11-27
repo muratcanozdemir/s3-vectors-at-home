@@ -61,3 +61,22 @@ def test_cli_list_and_status():
     out = run_cli(["status"])
     assert "Documents:" in out
     assert "Embedding model:" in out
+
+
+def test_cli_named_index_metadata_and_filter():
+    name = f"cli-{uuid.uuid4().hex[:8]}"
+    assert f"Created index {name}" in run_cli(["indexes", "create", name])
+    try:
+        assert name in run_cli(["indexes", "list"]).splitlines()
+        run_cli(["upload", "--index", name, "--doc-id", "a", "--text", "cats and dogs", "--metadata", '{"kind": "pets"}'])
+        run_cli(["upload", "--index", name, "--doc-id", "b", "--text", "cats and lions", "--metadata", '{"kind": "wild"}'])
+        out = run_cli(["search", "--index", name, "--query", "cats", "--filter", '{"kind": "wild"}'])
+        assert out == "Matches: ['b']"
+        assert '"kind": "pets"' in run_cli(["get", "--index", name, "--doc-id", "a"])
+        assert "Documents: 2" in run_cli(["status", "--index", name])
+    finally:
+        run_cli(["indexes", "delete", name])
+    result = subprocess.run(
+        ["uv", "run", "s3-vectors-cli", "list", "--index", name], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 1 and "not found" in result.stderr

@@ -40,30 +40,30 @@ def _store(bucket):
     return VectorStore(client, FakeEmbedder(), bucket=bucket)
 
 
-def _worker(bucket, worker, start, mode):
+def _worker(bucket, worker, start, mode, index="default"):
     store = _store(bucket)
     start.wait()
     ids = [f"w{worker}-d{i}" for i in range(DOCS_PER_WORKER)]
     if mode == "single":
         for doc_id in ids:
-            store.add_document(doc_id, f"text {doc_id}")
+            store.add_document(doc_id, f"text {doc_id}", {"worker": worker}, index=index)
     else:  # "batches": several small bulk writes
         for i in range(0, len(ids), 5):
-            store.add_documents((d, f"text {d}") for d in ids[i: i + 5])
+            store.add_documents(((d, f"text {d}", {"worker": worker}) for d in ids[i: i + 5]), index=index)
     # Delete every third doc this worker wrote.
     for doc_id in ids[::3]:
-        assert store.delete_document(doc_id)
+        assert store.delete_document(doc_id, index=index)
 
 
-def _reader(bucket, start, writers_done):
+def _reader(bucket, start, writers_done, index="default"):
     # Reads racing the writers (including the very first index creation)
     # must never fail or see a malformed index.
     store = _store(bucket)
     start.wait()
     while not writers_done.is_set():
-        store.search("text w0-d1", top_k=5)
-        store.list_documents(limit=50)
-        store.count_documents()
+        store.search("text w0-d1", top_k=5, index=index, filter={"worker": {"$in": [0, 1]}})
+        store.list_documents(limit=50, index=index)
+        store.count_documents(index=index)
 
 
 def _expected():
@@ -75,13 +75,15 @@ def _expected():
     }
 
 
-@pytest.mark.parametrize("mode", ["single", "batches"])
-def test_concurrent_writer_processes_lose_no_updates(mode):
+@pytest.mark.parametrize("mode,index", [("single", "default"), ("batches", "default"), ("single", "named")])
+def test_concurrent_writer_processes_lose_no_updates(mode, index):
     bucket = f"cas-test-{uuid.uuid4().hex[:10]}"
+    if index != "default":
+        _store(bucket).create_index(index)
     ctx = mp.get_context("spawn")
     start, writers_done = ctx.Event(), ctx.Event()
-    procs = [ctx.Process(target=_worker, args=(bucket, w, start, mode)) for w in range(WORKERS)]
-    readers = [ctx.Process(target=_reader, args=(bucket, start, writers_done)) for _ in range(READERS)]
+    procs = [ctx.Process(target=_worker, args=(bucket, w, start, mode, index)) for w in range(WORKERS)]
+    readers = [ctx.Process(target=_reader, args=(bucket, start, writers_done, index)) for _ in range(READERS)]
     for p in procs + readers:
         p.start()
     start.set()
@@ -96,14 +98,16 @@ def test_concurrent_writer_processes_lose_no_updates(mode):
     # A fresh store (empty cache) sees exactly the surviving docs.
     store = _store(bucket)
     expected = _expected()
-    listed = {d["doc_id"] for d in store.list_documents(limit=1000)}
+    listed = {d["doc_id"] for d in store.list_documents(limit=1000, index=index)}
     assert listed == expected, (
         f"missing from index: {sorted(expected - listed)[:10]}, "
         f"unexpected: {sorted(listed - expected)[:10]}"
     )
-    assert store.count_documents() == len(expected)
+    assert store.count_documents(index=index) == len(expected)
     for doc_id in sorted(expected)[:10]:
-        assert store.search(f"text {doc_id}", top_k=1) == [doc_id]
+        assert store.search(f"text {doc_id}", top_k=1, index=index) == [doc_id]
+        worker = int(doc_id[1: doc_id.index("-")])
+        assert store.get_document(doc_id, index=index)["metadata"] == {"worker": worker}
 
 
 def test_conditional_put_beyond_multipart_threshold_is_enforced():
@@ -141,3 +145,43 @@ def test_probe_rejects_real_minio_when_conditions_are_dropped(monkeypatch):
     monkeypatch.setattr(Minio, "_put_object", strip_conditions)
     with pytest.raises(core.ConditionalWritesUnsupportedError):
         _store(f"cas-probe-{uuid.uuid4().hex[:10]}")
+
+
+SHARED_DOCS = 5
+ROUNDS = 12
+
+
+def _same_doc_worker(bucket, worker, start):
+    store = _store(bucket)
+    start.wait()
+    for r in range(ROUNDS):
+        for i in range(SHARED_DOCS):
+            doc_id = f"shared-{i}"
+            if (worker + r + i) % 4 == 0:
+                store.delete_document(doc_id)
+            else:
+                store.add_document(doc_id, f"{doc_id} by w{worker} r{r}", {"by": worker, "round": r})
+
+
+def test_concurrent_writers_on_same_doc_ids_stay_consistent():
+    # Every process overwrites and deletes the same few doc_ids. Whatever
+    # the final winner, each surviving doc's text, metadata and vector must
+    # all come from the same write.
+    bucket = f"cas-same-{uuid.uuid4().hex[:10]}"
+    ctx = mp.get_context("spawn")
+    start = ctx.Event()
+    procs = [ctx.Process(target=_same_doc_worker, args=(bucket, w, start)) for w in range(WORKERS)]
+    for p in procs:
+        p.start()
+    start.set()
+    for p in procs:
+        p.join(timeout=240)
+    assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+
+    store = _store(bucket)
+    for d in store.list_documents(limit=100):
+        doc = store.get_document(d["doc_id"])
+        by, rnd = doc["metadata"]["by"], doc["metadata"]["round"]
+        assert doc["text"] == f"{d['doc_id']} by w{by} r{rnd}"  # text and metadata from one write
+        top = store.search_with_scores(doc["text"], top_k=1)[0]
+        assert top["doc_id"] == d["doc_id"] and top["score"] > 0.9999  # ...and so is the vector

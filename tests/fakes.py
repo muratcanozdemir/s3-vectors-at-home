@@ -119,8 +119,12 @@ class FakeMinioClient:
         except KeyError:
             raise _not_found(bucket, key)
 
-    def list_objects(self, bucket):
-        return [_Object(name) for name in sorted(self.objects.get(bucket, {}))]
+    def list_objects(self, bucket, prefix=None):
+        return [
+            _Object(name)
+            for name in sorted(self.objects.get(bucket, {}))
+            if prefix is None or name.startswith(prefix)
+        ]
 
 
 class FakeEmbedder:

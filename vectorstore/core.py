@@ -1,8 +1,8 @@
 import hashlib
-import io
 import json
 import os
 import random
+import re
 import struct
 import threading
 import time
@@ -14,31 +14,38 @@ import numpy as np
 from minio.error import S3Error
 
 from minio import Minio
+from vectorstore.filters import matches, validate_filter, validate_metadata
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 BUCKET = "vectors"
-# The FAISS index and its {int id: doc_id} map live in ONE object, so a
-# single PUT replaces both atomically. (They used to be two objects,
-# written one after the other: a crash or a concurrent writer in between
-# could leave an index whose ids the map didn't match.)
-INDEX_OBJ = "index.v2.bin"
-INDEX_MAGIC = b"S3VAH-IDX\x01"
-# Pre-v2 layout. Never read: a bucket that only has these has no INDEX_OBJ,
-# so the index is rebuilt from the per-document vectors and these are
-# removed. Kept reserved so no doc_id can collide with them.
-LEGACY_INDEX_OBJS = ("faiss.index", "index.ids.json")
-RESERVED_OBJECT_NAMES = {INDEX_OBJ, *LEGACY_INDEX_OBJS}
+DEFAULT_INDEX = "default"
 MAX_DOC_ID_LENGTH = 512
 MAX_TOP_K = 1000
 MAX_PAGE_SIZE = 1000
-# Object-store calls are network round trips, so independent ones (the
-# per-document objects of a bulk write, a page of metadata reads, the
-# vectors of a rebuild) run in parallel. Kept below minio-py's urllib3
-# pool size (10) so workers don't queue for connections.
+# Index names: 1-63 of [a-z0-9-], not starting or ending with "-".
+_INDEX_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+# Each named index is ONE object holding everything about its documents:
+# doc_id, text, metadata and vector. A single conditional PUT therefore
+# updates a document's text, metadata and vector together, so they can never
+# disagree, even when several processes write the same doc_id at once.
+INDEX_PREFIX = "indexes/"
+INDEX_SUFFIX = ".v3.bin"
+INDEX_MAGIC = b"S3VAH-IDX\x03"
+
+# Older layouts, only ever read, to migrate into the default index the first
+# time it is used:
+#   v2: root "index.v2.bin" (FAISS + {id: doc_id}) plus per-doc objects;
+#   v1: root "faiss.index" + "index.ids.json" plus per-doc objects.
+# Per-doc objects are "<doc_id>.npy" (vector) and "<doc_id>.meta.json"
+# ({"doc_id", "text"}). They are left in place after migration (nothing
+# reads them again; delete them once you no longer need to roll back).
+LEGACY_V2_INDEX_OBJ = "index.v2.bin"
+LEGACY_V2_MAGIC = b"S3VAH-IDX\x01"
+
+# Migration reads legacy per-doc objects in parallel. Kept below minio-py's
+# urllib3 pool size (10) so workers don't queue for connections.
 DEFAULT_IO_WORKERS = 8
-# Bulk writes embed this many texts at a time, uploading each chunk while
-# the next one is embedded (CPU-bound model work overlaps network I/O).
-EMBED_CHUNK_SIZE = 256
 # Compare-and-swap retries for index writes that lose a race to another
 # writer. Each retry reloads the index; backoff is exponential with full
 # jitter, capped, so contending writers spread out instead of colliding in
@@ -48,10 +55,9 @@ INDEX_WRITE_BACKOFF_BASE_S = 0.005
 INDEX_WRITE_BACKOFF_CAP_S = 0.25
 # Conditional writes go out as a single PUT (conditions on multipart
 # uploads are a different, less widely supported mechanism), and S3 caps a
-# single PUT at 5 GiB. At 384 float32 dims that is ~3.4M documents.
+# single PUT at 5 GiB.
 MAX_SINGLE_PUT_BYTES = 5 * 1024**3
-# Throwaway objects for the startup conditional-write probe. doc_ids can't
-# contain "/", so nothing under this prefix can collide with a document.
+# Throwaway objects for the startup conditional-write probe.
 PROBE_PREFIX = "_probe/"
 # S3 error codes meaning "a conditional write lost to a concurrent change".
 _CONFLICT_CODES = {"PreconditionFailed", "ConditionalRequestConflict"}
@@ -59,6 +65,14 @@ _CONFLICT_CODES = {"PreconditionFailed", "ConditionalRequestConflict"}
 
 class ObjectNotFoundError(Exception):
     """Raised when a requested object does not exist in the backing store."""
+
+
+class IndexNotFoundError(LookupError):
+    """The named index doesn't exist (create it first)."""
+
+
+class IndexAlreadyExistsError(Exception):
+    """An index with that name already exists."""
 
 
 class ConditionalWritesUnsupportedError(RuntimeError):
@@ -82,64 +96,115 @@ class _WriteConflict(Exception):
 
 
 def object_key_id(doc_id: str) -> int:
-    """Deterministic id for a doc_id, used as its FAISS vector id.
+    """Deterministic 63-bit id for a doc_id, used as its FAISS vector id.
 
-    Derived from a hash rather than insertion order so the FAISS index and
-    the doc_id it maps to stay tied together even after removals/updates --
-    the previous design tracked ids as a plain list kept in lockstep with
-    FAISS insertion order, which silently drifted whenever an add and an
-    index update weren't perfectly paired (see exploration.md bug #4).
+    A hash rather than insertion order keeps the vector tied to its doc_id
+    through removals and updates. Two doc_ids hashing to the same id is
+    astronomically unlikely, but it is detected (see `add_documents`)
+    rather than allowed to silently overwrite a document.
     """
     digest = hashlib.sha1(doc_id.encode("utf-8")).digest()[:8]
     return int.from_bytes(digest, "big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 
 def validate_doc_id(doc_id: str) -> None:
-    if not doc_id:
-        raise ValueError("doc_id must not be empty")
+    if not isinstance(doc_id, str) or not doc_id:
+        raise ValueError("doc_id must be a non-empty string")
+    # Not an object key any more, but it is a URL path segment in the API.
     if "/" in doc_id:
         raise ValueError("doc_id must not contain '/'")
-    if doc_id in RESERVED_OBJECT_NAMES:
-        raise ValueError(f"doc_id {doc_id!r} is reserved")
     if len(doc_id) > MAX_DOC_ID_LENGTH:
         raise ValueError(f"doc_id must be at most {MAX_DOC_ID_LENGTH} characters")
 
 
+def validate_index_name(name: str) -> None:
+    if not isinstance(name, str) or not _INDEX_NAME_RE.match(name):
+        raise ValueError(
+            "index name must be 1-63 characters of lowercase letters, digits and '-', "
+            "not starting or ending with '-'"
+        )
+
+
+def index_object_key(name: str) -> str:
+    return f"{INDEX_PREFIX}{name}{INDEX_SUFFIX}"
+
+
+class _IndexState:
+    """One index in memory: the FAISS index plus every document's fields.
+
+    `docs` maps FAISS id -> {"doc_id", "text", "metadata"}. `by_id` is the
+    reverse lookup, derived from `docs`.
+    """
+
+    __slots__ = ("by_id", "dim", "docs", "faiss")
+
+    def __init__(self, dim: int, faiss_index=None, docs=None):
+        self.dim = dim
+        self.faiss = faiss_index if faiss_index is not None else faiss.IndexIDMap2(faiss.IndexFlatL2(dim))
+        self.docs: dict[int, dict] = docs or {}
+        self.by_id = {d["doc_id"]: k for k, d in self.docs.items()}
+
+    # Blob layout: INDEX_MAGIC | u64 big-endian length of header JSON |
+    # header JSON {"dim", "docs": [[id, doc_id, text, metadata], ...]} |
+    # faiss.serialize_index bytes. (faiss.write_index needs a path/FILE*;
+    # serialize_index/deserialize_index are the in-memory round trip.)
+
+    def encode(self) -> bytes:
+        header = json.dumps(
+            {"dim": self.dim, "docs": [[k, d["doc_id"], d["text"], d["metadata"]] for k, d in self.docs.items()]}
+        ).encode()
+        return b"".join((INDEX_MAGIC, struct.pack(">Q", len(header)), header, faiss.serialize_index(self.faiss).tobytes()))
+
+    @classmethod
+    def decode(cls, blob: bytes, key: str) -> "_IndexState":
+        if not blob.startswith(INDEX_MAGIC):
+            raise ValueError(f"{key} is not a recognised index blob")
+        pos = len(INDEX_MAGIC)
+        (header_len,) = struct.unpack_from(">Q", blob, pos)
+        pos += 8
+        header = json.loads(blob[pos: pos + header_len])
+        index = faiss.deserialize_index(np.frombuffer(blob, dtype=np.uint8, offset=pos + header_len))
+        docs = {int(k): {"doc_id": d, "text": t, "metadata": m} for k, d, t, m in header["docs"]}
+        if index.ntotal != len(docs):
+            raise ValueError(f"{key} is corrupt: {index.ntotal} vectors but {len(docs)} documents")
+        return cls(header["dim"], index, docs)
+
+
 class VectorStore:
-    """Text + vector storage backed by an object store, indexed with FAISS.
+    """Named vector indexes over an object store, searched with FAISS.
 
-    Takes its object-store client and embedder as constructor arguments
-    instead of reaching for module-level globals, so it can be built once
-    (lazily, from env vars -- see `get_store`) for the real app, or built
-    directly with fakes in tests with no network/model download involved.
+    Takes its object-store client and embedder as constructor arguments, so
+    it can be built once from env vars for the real app (`get_store`) or
+    directly with fakes in tests.
 
-    The FAISS index is a single `IndexIDMap2`, with ids derived from doc_id
-    (`object_key_id`). That lets add/update/delete mutate the index in place
-    via `add_with_ids`/`remove_ids` -- no full rebuild needed except to
-    bootstrap a missing index from the individually-stored vectors.
+    Indexes. A store holds any number of named indexes; "default" always
+    exists (it's created on first use, migrating data from older layouts if
+    there is any). Others are created and deleted explicitly. Every method
+    takes `index=`, defaulting to "default".
 
     Concurrency. Any number of processes (uvicorn workers, CLI runs) may
     read and write the same bucket. Index updates are compare-and-swap: a
     writer loads the index *and the ETag it was served with*, applies its
-    change, and PUTs with `If-Match: <that etag>` (or `If-None-Match: *` if
-    there was no index yet). If another writer got there first the PUT is
-    rejected, and the writer reloads and re-applies its change on top. Every
-    change is an explicit, idempotent edit ("upsert these ids", "remove this
-    id") rather than "write back what I read", so re-applying it -- even on
-    a state that already contains it, as when a PUT succeeded but its
-    response was lost and the client's retry got a 412 -- is harmless.
-    The index object is never deleted once created (an empty corpus is an
-    empty index), so a slow writer can never re-create it from stale data.
-    `self._lock` serialises the same within one process and guards the
-    cached FAISS object, which isn't safe to search while being mutated.
+    change, and PUTs with `If-Match: <that etag>` (or `If-None-Match: *` to
+    create). If another writer got there first the PUT is rejected, and the
+    writer reloads and re-applies its change on top. Every change is an
+    explicit, idempotent edit ("upsert these docs", "remove this doc"), so
+    re-applying it -- even on a state that already contains it, as when a
+    PUT succeeded but its response was lost and the client's retry got a
+    412 -- is harmless. Because a document's text, metadata and vector live
+    in the same object, concurrent writes to the *same* doc_id are ordered
+    too: the last successful write wins, whole. `self._lock` serialises the
+    same within one process and guards the cached FAISS objects, which
+    aren't safe to search while being mutated.
 
-    Not covered: two callers writing the *same* doc_id at the same time
-    (e.g. one adding it while another deletes it). The index stays
-    internally consistent, but its entry for that doc may disagree with the
-    doc's `.npy`/`.meta.json` objects until the doc is written again.
+    The default index is never deleted, so its one-time migration from the
+    old layout can't run twice. A deleted named index stays deleted: a
+    writer that loses to the delete reloads, finds no index and fails with
+    IndexNotFoundError rather than re-creating it.
 
-    Caching. The loaded index is kept in memory with its ETag. Each read
-    does a cheap HEAD and only downloads the index if the ETag changed.
+    Caching. Each loaded index is kept in memory with its ETag. Every
+    operation does a cheap HEAD and only downloads an index whose ETag
+    changed.
     """
 
     def __init__(self, client: Minio, embedder, bucket: str = BUCKET, io_workers: int = DEFAULT_IO_WORKERS):
@@ -148,8 +213,9 @@ class VectorStore:
         self._bucket = bucket
         self._lock = threading.Lock()
         self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
-        # (etag, index, id_map) of the last index this process read or wrote.
-        self._cache: tuple[str, object, dict] | None = None
+        # index name -> (etag, _IndexState) of the last version this process read or wrote.
+        self._cache: dict[str, tuple[str, _IndexState]] = {}
+        self._dim: int | None = None
         self._ensure_bucket()
         self._verify_conditional_writes()
 
@@ -224,22 +290,7 @@ class VectorStore:
             resp.release_conn()
 
     def _get_bytes(self, key: str) -> bytes:
-        try:
-            resp = self._client.get_object(self._bucket, key)
-        except S3Error as e:
-            if e.code == "NoSuchKey":
-                raise ObjectNotFoundError(key) from e
-            raise
-        try:
-            return resp.read()
-        finally:
-            resp.close()
-            resp.release_conn()
-
-    def _put_bytes(self, key: str, data: bytes) -> str:
-        """Write an object and return its (unquoted) ETag."""
-        result = self._client.put_object(self._bucket, key, io.BytesIO(data), length=len(data))
-        return _normalize_etag(result.etag)
+        return self._get_with_etag(key)[0]
 
     def _etag(self, key: str) -> str | None:
         try:
@@ -255,12 +306,6 @@ class VectorStore:
         except S3Error as e:
             if e.code != "NoSuchKey":
                 raise
-        except ObjectNotFoundError:
-            pass
-
-    def _parallel(self, fn, items) -> list:
-        """fn over items on the I/O pool, results in order; re-raises the first error."""
-        return list(self._io.map(fn, items))
 
     def _embed_many(self, texts: list[str]) -> np.ndarray:
         vecs = self._embedder.encode(texts, normalize_embeddings=True)
@@ -269,267 +314,332 @@ class VectorStore:
     def _embed(self, text: str) -> np.ndarray:
         return self._embed_many([text])[0]
 
-    # -- index persistence ------------------------------------------------
-    # Blob layout: INDEX_MAGIC | u64 big-endian length of ids JSON | ids JSON
-    # | faiss.serialize_index bytes. faiss.write_index/read_index need a
-    # path/FILE*/IOWriter, not a file-like object -- serialize_index /
-    # deserialize_index are the supported in-memory round trip.
+    def _embedding_dim(self) -> int:
+        if self._dim is None:
+            self._dim = int(self._embed("dimension probe").shape[0])
+        return self._dim
 
-    @staticmethod
-    def _encode_index(index, id_map: dict) -> bytes:
-        ids_json = json.dumps({str(k): v for k, v in id_map.items()}).encode()
-        return b"".join(
-            (INDEX_MAGIC, struct.pack(">Q", len(ids_json)), ids_json, faiss.serialize_index(index).tobytes())
-        )
+    # -- index state ------------------------------------------------------
 
-    @staticmethod
-    def _decode_index(blob: bytes):
-        if not blob.startswith(INDEX_MAGIC):
-            raise ValueError(f"{INDEX_OBJ} is not a recognised index blob")
-        pos = len(INDEX_MAGIC)
-        (ids_len,) = struct.unpack_from(">Q", blob, pos)
-        pos += 8
-        id_map = {int(k): v for k, v in json.loads(blob[pos: pos + ids_len]).items()}
-        index = faiss.deserialize_index(np.frombuffer(blob, dtype=np.uint8, offset=pos + ids_len))
-        return index, id_map
-
-    def _load_index(self):
-        """(index, id_map, etag) as currently stored; (None, {}, None) if there is none.
+    def _load(self, name: str) -> tuple[_IndexState | None, str | None]:
+        """(state, etag) as currently stored; (None, None) if the index doesn't exist.
 
         Must be called with `self._lock` held. Serves the cache when the
         HEAD shows an unchanged ETag. Otherwise downloads, and keys the cache
         on the ETag of that same GET response, so the content and the ETag a
         later If-Match is checked against always belong together.
         """
-        etag = self._etag(INDEX_OBJ)
+        key = index_object_key(name)
+        etag = self._etag(key)
         if etag is None:
-            self._cache = None
-            return None, {}, None
-        if self._cache is not None and self._cache[0] == etag:
-            return self._cache[1], self._cache[2], etag
+            self._cache.pop(name, None)
+            return None, None
+        cached = self._cache.get(name)
+        if cached is not None and cached[0] == etag:
+            return cached[1], etag
         try:
-            blob, etag = self._get_with_etag(INDEX_OBJ)
+            blob, etag = self._get_with_etag(key)
         except ObjectNotFoundError:
-            self._cache = None
-            return None, {}, None
-        index, id_map = self._decode_index(blob)
-        self._cache = (etag, index, id_map)
-        return index, id_map, etag
+            self._cache.pop(name, None)
+            return None, None
+        state = _IndexState.decode(blob, key)
+        self._cache[name] = (etag, state)
+        return state, etag
 
-    def _build_index_from_vectors(self):
-        """Index the individually-stored vectors; (None, {}) if there are none.
+    def _initial_default_state(self) -> _IndexState:
+        """State for a default index that doesn't exist yet: migrated, or empty.
 
-        Only needed when there is no index object yet: first write, a bucket
-        still on the pre-v2 two-object layout, or the index object was
-        removed by hand. The result is only ever *created* (If-None-Match),
-        so a build from a stale listing can't replace a real index.
+        Only ever *created* (If-None-Match), so if two processes migrate at
+        once exactly one result is kept and the other process uses it.
         """
-        for legacy in LEGACY_INDEX_OBJS:
-            self._delete_object(legacy)
-        doc_ids = [
-            obj.object_name.removesuffix(".npy")
-            for obj in self._client.list_objects(self._bucket)
-            if obj.object_name.endswith(".npy")
-        ]
-        if not doc_ids:
-            return None, {}
-        vectors = self._parallel(
-            lambda d: np.frombuffer(self._get_bytes(f"{d}.npy"), dtype=np.float32), doc_ids
-        )
-        index = faiss.IndexIDMap2(faiss.IndexFlatL2(vectors[0].shape[0]))
+        legacy = self._legacy_docs()
+        if not legacy:
+            return _IndexState(self._embedding_dim())
+        doc_ids = list(legacy)
+        vectors = np.vstack([legacy[d][0] for d in doc_ids])
+        state = _IndexState(vectors.shape[1])
         keys = np.array([object_key_id(d) for d in doc_ids], dtype="int64")
-        index.add_with_ids(np.vstack(vectors), keys)
-        return index, dict(zip((int(k) for k in keys), doc_ids))
+        state.faiss.add_with_ids(vectors, keys)
+        for k, d in zip(keys, doc_ids):
+            state.docs[int(k)] = {"doc_id": d, "text": legacy[d][1], "metadata": {}}
+            state.by_id[d] = int(k)
+        return state
 
-    def _update_index(self, edit):
-        """Apply `edit` to the stored index with compare-and-swap, retrying on conflict.
+    def _legacy_docs(self) -> dict[str, tuple[np.ndarray, str]]:
+        """{doc_id: (vector, text)} from a pre-v3 bucket; {} if there is none.
 
-        `edit(index_or_None, id_map)` mutates in place and returns
-        `(index_or_None, changed)`. It must be idempotent -- it may run
-        again on a fresh state after a lost race, including a state that
-        already contains its own effect.
+        A v2 index decides which docs are live (its map is what search used);
+        without one, every doc with both a vector and a text object is. Docs
+        missing either object are skipped: on the old layout they were
+        unreachable (list skipped them) or had no vector to search by.
         """
+        names = {obj.object_name for obj in self._client.list_objects(self._bucket)}
+        if LEGACY_V2_INDEX_OBJ in names:
+            blob = self._get_bytes(LEGACY_V2_INDEX_OBJ)
+            if not blob.startswith(LEGACY_V2_MAGIC):
+                raise ValueError(f"{LEGACY_V2_INDEX_OBJ} is not a recognised v2 index blob")
+            (ids_len,) = struct.unpack_from(">Q", blob, len(LEGACY_V2_MAGIC))
+            start = len(LEGACY_V2_MAGIC) + 8
+            live = list(json.loads(blob[start: start + ids_len]).values())
+        else:
+            live = [n.removesuffix(".npy") for n in names if n.endswith(".npy")]
+        live = [d for d in live if f"{d}.npy" in names and f"{d}.meta.json" in names]
+
+        def read(doc_id):
+            vec = np.frombuffer(self._get_bytes(f"{doc_id}.npy"), dtype=np.float32)
+            text = json.loads(self._get_bytes(f"{doc_id}.meta.json")).get("text", "")
+            return doc_id, (vec, text)
+
+        return dict(self._io.map(read, live))
+
+    def _read(self, name: str) -> _IndexState:
+        """Current state of index `name` for reading. Must hold `self._lock`."""
+        for _ in range(INDEX_WRITE_ATTEMPTS):
+            state, _ = self._load(name)
+            if state is not None:
+                return state
+            if name != DEFAULT_INDEX:
+                raise IndexNotFoundError(name)
+            state = self._initial_default_state()
+            try:
+                etag = self._put_conditional(index_object_key(name), state.encode(), if_match=None)
+            except _WriteConflict:
+                continue  # someone else created it first: use theirs
+            self._cache[name] = (etag, state)
+            return state
+        raise IndexWriteConflictError("index kept changing while being created; retry the operation")
+
+    def _update(self, name: str, edit):
+        """Apply `edit` to index `name` with compare-and-swap, retrying on conflict.
+
+        `edit(state)` mutates `state` in place and returns `(changed, result)`;
+        `result` is what this method returns. It must be idempotent -- it may
+        run again on a fresh state after a lost race, including a state that
+        already contains its own effect -- and must raise (to abort, writing
+        nothing) before it mutates anything.
+        """
+        key = index_object_key(name)
         with self._lock:
             for attempt in range(INDEX_WRITE_ATTEMPTS):
-                index, id_map, etag = self._load_index()
-                bootstrapped = False
-                if index is None:
-                    index, id_map = self._build_index_from_vectors()
-                    bootstrapped = index is not None
-                # From here the cached index may be mutated in place, so drop
+                state, etag = self._load(name)
+                created = False
+                if state is None:
+                    if name != DEFAULT_INDEX:
+                        raise IndexNotFoundError(name)
+                    state, created = self._initial_default_state(), True
+                # From here the cached state may be mutated in place, so drop
                 # it unless the write succeeds; a later read must not take
                 # unpersisted state for the stored version.
-                self._cache = None
-                index, changed = edit(index, id_map)
-                if index is None or not (changed or bootstrapped):
-                    if etag is not None and index is not None and not changed:
-                        self._cache = (etag, index, id_map)
-                    return
+                self._cache.pop(name, None)
+                changed, result = edit(state)
+                if not (changed or created):
+                    assert etag is not None  # not created, so it was loaded with one
+                    self._cache[name] = (etag, state)  # untouched: still that version
+                    return result
                 try:
-                    new_etag = self._put_conditional(INDEX_OBJ, self._encode_index(index, id_map), if_match=etag)
+                    new_etag = self._put_conditional(key, state.encode(), if_match=etag)
                 except _WriteConflict:
                     time.sleep(random.uniform(0, min(INDEX_WRITE_BACKOFF_CAP_S, INDEX_WRITE_BACKOFF_BASE_S * 2**attempt)))
                     continue
-                self._cache = (new_etag, index, id_map) if new_etag else None
-                return
+                if new_etag:
+                    self._cache[name] = (new_etag, state)
+                return result
         raise IndexWriteConflictError(
             f"index update lost to concurrent writers {INDEX_WRITE_ATTEMPTS} times in a row; retry the operation"
         )
 
-    def _read_index(self):
-        """Index and id map for reading; (None, {}) if there are no documents.
+    # -- indexes --------------------------------------------------------------
 
-        Must be called with `self._lock` held. If there's no index object
-        but there are stored vectors, builds it and tries to create it so
-        other readers needn't rebuild too; losing that race just means
-        someone else's index is the one to use.
-        """
-        for _ in range(INDEX_WRITE_ATTEMPTS):
-            index, id_map, _etag = self._load_index()
-            if index is not None:
-                return index, id_map
-            index, id_map = self._build_index_from_vectors()
-            if index is None:
-                return None, {}
+    def list_indexes(self) -> list[str]:
+        names = {DEFAULT_INDEX}
+        for obj in self._client.list_objects(self._bucket, prefix=INDEX_PREFIX):
+            if obj.object_name.endswith(INDEX_SUFFIX):
+                names.add(obj.object_name[len(INDEX_PREFIX): -len(INDEX_SUFFIX)])
+        return sorted(names)
+
+    def create_index(self, name: str) -> None:
+        validate_index_name(name)
+        if name == DEFAULT_INDEX:
+            raise IndexAlreadyExistsError(name)
+        state = _IndexState(self._embedding_dim())
+        with self._lock:
             try:
-                new_etag = self._put_conditional(INDEX_OBJ, self._encode_index(index, id_map), if_match=None)
+                etag = self._put_conditional(index_object_key(name), state.encode(), if_match=None)
             except _WriteConflict:
-                continue
-            self._cache = (new_etag, index, id_map) if new_etag else None
-            return index, id_map
-        raise IndexWriteConflictError("index kept changing while being bootstrapped; retry the operation")
+                raise IndexAlreadyExistsError(name) from None
+            self._cache[name] = (etag, state)
 
-    # -- public API ---------------------------------------------------------
+    def delete_index(self, name: str) -> None:
+        validate_index_name(name)
+        if name == DEFAULT_INDEX:
+            raise ValueError("the default index can't be deleted")
+        key = index_object_key(name)
+        with self._lock:
+            if self._etag(key) is None:
+                raise IndexNotFoundError(name)
+            self._delete_object(key)
+            self._cache.pop(name, None)
 
-    def add_document(self, doc_id: str, text: str):
-        """Add a new document, or replace the vector+text of an existing one."""
-        self.add_documents([(doc_id, text)])
+    # -- documents ------------------------------------------------------------
 
-    def add_documents(self, docs) -> int:
+    def add_document(self, doc_id: str, text: str, metadata: dict | None = None, index: str = DEFAULT_INDEX):
+        """Add a new document, or replace the text, metadata and vector of an existing one."""
+        self.add_documents([(doc_id, text, metadata)], index=index)
+
+    def add_documents(self, docs, index: str = DEFAULT_INDEX) -> int:
         """Add or replace many documents with one embed call and one index write.
 
-        `docs` is an iterable of (doc_id, text) pairs. Every doc_id is
-        validated before anything is written, so an invalid id rejects the
-        whole batch instead of leaving it half-applied. If a doc_id appears
-        more than once, the last occurrence wins. Returns the number of
-        distinct documents written.
+        `docs` is an iterable of (doc_id, text) or (doc_id, text, metadata).
+        Everything is validated before anything is written, so one bad
+        document rejects the whole batch. If a doc_id appears more than once,
+        the last occurrence wins. Returns the number of distinct documents
+        written.
         """
-        batch: dict[str, str] = {}
-        for doc_id, text in docs:
+        validate_index_name(index)
+        batch: dict[str, tuple[str, dict]] = {}
+        for doc in docs:
+            doc_id, text, metadata = (*doc, None) if len(doc) == 2 else doc
             validate_doc_id(doc_id)
-            batch[doc_id] = text
+            if not isinstance(text, str):
+                raise ValueError(f"text for {doc_id!r} must be a string")  # noqa: TRY004 -- API maps ValueError to 400
+            batch[doc_id] = (text, validate_metadata(metadata))
         if not batch:
             return 0
         doc_ids = list(batch)
-        # Embed chunk by chunk, handing each chunk's uploads to the I/O pool
-        # before embedding the next, so uploads overlap embedding.
-        chunks, uploads = [], []
-        for start in range(0, len(doc_ids), EMBED_CHUNK_SIZE):
-            chunk_ids = doc_ids[start: start + EMBED_CHUNK_SIZE]
-            chunk_vecs = self._embed_many([batch[d] for d in chunk_ids])
-            chunks.append(chunk_vecs)
-            for doc_id, vec in zip(chunk_ids, chunk_vecs):
-                meta = json.dumps({"doc_id": doc_id, "text": batch[doc_id]}).encode()
-                uploads.append(self._io.submit(self._put_bytes, f"{doc_id}.npy", vec.tobytes()))
-                uploads.append(self._io.submit(self._put_bytes, f"{doc_id}.meta.json", meta))
-        for f in uploads:
-            f.result()  # wait for all; re-raise the first failure before touching the index
-        vecs = np.vstack(chunks)
-        keys = np.array([object_key_id(d) for d in doc_ids], dtype="int64")
+        vecs = self._embed_many([batch[d][0] for d in doc_ids])
+        keys = [object_key_id(d) for d in doc_ids]
 
-        def upsert(index, id_map):
-            if index is None:
-                index = faiss.IndexIDMap2(faiss.IndexFlatL2(vecs.shape[1]))
-            else:
-                existing = np.array([k for k in keys if int(k) in id_map], dtype="int64")
-                if existing.size:
-                    index.remove_ids(existing)
-            index.add_with_ids(vecs, keys)
-            id_map.update(zip((int(k) for k in keys), doc_ids))
-            return index, True
+        def upsert(state: _IndexState):
+            # Validate against the current state first: raising after a
+            # mutation would leave the (uncached) state half-edited.
+            if vecs.shape[1] != state.dim:
+                raise ValueError(f"embedding dimension {vecs.shape[1]} doesn't match index {index!r} ({state.dim})")
+            for doc_id, key in zip(doc_ids, keys):
+                owner = state.docs.get(key)
+                if owner is not None and owner["doc_id"] != doc_id:
+                    raise ValueError(f"doc_id {doc_id!r} collides with {owner['doc_id']!r}; use another doc_id")
+            existing = np.array([k for k in keys if k in state.docs], dtype="int64")
+            if existing.size:
+                state.faiss.remove_ids(existing)
+            state.faiss.add_with_ids(vecs, np.array(keys, dtype="int64"))
+            for doc_id, key in zip(doc_ids, keys):
+                text, metadata = batch[doc_id]
+                state.docs[key] = {"doc_id": doc_id, "text": text, "metadata": metadata}
+                state.by_id[doc_id] = key
+            return True, len(doc_ids)
 
-        self._update_index(upsert)
-        return len(doc_ids)
+        return self._update(index, upsert)
 
-    def get_document(self, doc_id: str):
-        try:
-            return json.loads(self._get_bytes(f"{doc_id}.meta.json"))
-        except ObjectNotFoundError:
-            return None
+    def get_document(self, doc_id: str, index: str = DEFAULT_INDEX):
+        """{"doc_id", "text", "metadata"}, or None if there's no such document."""
+        validate_index_name(index)
+        with self._lock:
+            state = self._read(index)
+            key = state.by_id.get(doc_id)
+            return None if key is None else _public(state.docs[key])
 
-    def list_documents(self, skip: int = 0, limit: int = 100):
+    def list_documents(self, skip: int = 0, limit: int = 100, index: str = DEFAULT_INDEX):
         if skip < 0:
             raise ValueError("skip must not be negative")
         if not 0 <= limit <= MAX_PAGE_SIZE:
             raise ValueError(f"limit must be between 0 and {MAX_PAGE_SIZE}")
-        # The (cached) index's id map is the list of searchable documents,
-        # so paging reads it instead of listing every object in the bucket.
-        page = sorted(self._indexed_doc_ids())[skip: skip + limit]
-        metas = self._parallel(self.get_document, page)
-        return [
-            {"doc_id": doc_id, "text_preview": meta.get("text", "")[:64]}
-            for doc_id, meta in zip(page, metas)
-            if meta
-        ]
+        validate_index_name(index)
+        with self._lock:
+            state = self._read(index)
+            page = sorted(state.by_id)[skip: skip + limit]
+            return [
+                {"doc_id": d, "text_preview": doc["text"][:64], "metadata": _copy_metadata(doc["metadata"])}
+                for d in page
+                for doc in (state.docs[state.by_id[d]],)
+            ]
 
-    def delete_document(self, doc_id: str) -> bool:
-        if self.get_document(doc_id) is None:
-            return False
-        # Objects first, then the index: if a rebuild-from-vectors races
-        # with this delete, the vector is already gone from its listing.
-        self._delete_object(f"{doc_id}.npy")
-        self._delete_object(f"{doc_id}.meta.json")
-        key = object_key_id(doc_id)
+    def delete_document(self, doc_id: str, index: str = DEFAULT_INDEX) -> bool:
+        """Delete a document; False if it wasn't there.
 
-        def remove(index, id_map):
-            if index is None or key not in id_map:
-                return index, False
-            # An emptied index is written as-is, never deleted: see the
-            # class docstring for why the index object must not disappear.
-            index.remove_ids(np.array([key], dtype="int64"))
-            del id_map[key]
-            return index, True
+        True once *any* attempt found the document: from then on its removal
+        is guaranteed. That matters when a PUT lands but is reported as a
+        conflict -- the retry no longer finds the doc, and answering "not
+        found" would tell the caller its own successful delete failed. (If
+        another process deleted it concurrently, both report True, as
+        idempotent deletes do.)
+        """
+        validate_index_name(index)
+        found = False
 
-        self._update_index(remove)
-        return True
+        def remove(state: _IndexState):
+            nonlocal found
+            key = state.by_id.get(doc_id)
+            if key is None:
+                return False, found
+            found = True
+            state.faiss.remove_ids(np.array([key], dtype="int64"))
+            del state.docs[key]
+            del state.by_id[doc_id]
+            return True, True
 
-    def search(self, query: str, top_k: int = 5) -> list[str]:
-        """doc_ids of the top_k closest documents, closest first."""
-        return [r["doc_id"] for r in self.search_with_scores(query, top_k)]
+        return self._update(index, remove)
 
-    def search_with_scores(self, query: str, top_k: int = 5) -> list[dict]:
-        """Top_k matches as [{"doc_id", "score"}], closest first.
+    def search(self, query: str, top_k: int = 5, index: str = DEFAULT_INDEX, filter: dict | None = None) -> list[str]:
+        """doc_ids of the top_k closest matching documents, closest first."""
+        return [r["doc_id"] for r in self.search_with_scores(query, top_k, index=index, filter=filter)]
 
-        `score` is cosine similarity (-1..1, higher is closer). Vectors are
-        unit-normalised, so it follows from FAISS's squared L2 distance d
-        as 1 - d/2 without changing the index type.
+    def search_with_scores(
+        self, query: str, top_k: int = 5, index: str = DEFAULT_INDEX, filter: dict | None = None
+    ) -> list[dict]:
+        """Top_k matches as [{"doc_id", "score", "metadata"}], closest first.
+
+        `filter` (see vectorstore.filters) restricts the search to documents
+        whose metadata matches; the search is still exact, i.e. these are the
+        true top_k among the matching documents. `score` is cosine
+        similarity (-1..1, higher is closer): vectors are unit-normalised,
+        so it is 1 - d/2 from FAISS's squared L2 distance d.
         """
         if not 1 <= top_k <= MAX_TOP_K:
             raise ValueError(f"top_k must be between 1 and {MAX_TOP_K}")
-        qv = self._embed(query)
+        validate_index_name(index)
+        if filter:
+            validate_filter(filter)
+        qv = np.expand_dims(self._embed(query), axis=0)
         with self._lock:
-            index, id_map = self._read_index()
-            if index is None:
-                return []
-            distances, result_ids = index.search(np.expand_dims(qv, axis=0), top_k)
-        # FAISS pads short result sets with sentinel id -1; must be excluded
-        # explicitly or it aliases to the last id_map entry looked up.
-        return [
-            {"doc_id": id_map[int(i)], "score": float(1.0 - d / 2.0)}
-            for d, i in zip(distances[0], result_ids[0])
-            if i != -1
-        ]
+            state = self._read(index)
+            if filter:
+                allowed = np.array([k for k, d in state.docs.items() if matches(filter, d["metadata"])], dtype="int64")
+                if not allowed.size:
+                    return []
+                params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
+                distances, result_ids = state.faiss.search(qv, top_k, params=params)
+            else:
+                if state.faiss.ntotal == 0:
+                    return []
+                distances, result_ids = state.faiss.search(qv, top_k)
+            # FAISS pads short result sets with id -1: skip those.
+            return [
+                {
+                    "doc_id": state.docs[int(i)]["doc_id"],
+                    "score": float(1.0 - d / 2.0),
+                    "metadata": _copy_metadata(state.docs[int(i)]["metadata"]),
+                }
+                for d, i in zip(distances[0], result_ids[0])
+                if i != -1
+            ]
 
-    def count_documents(self) -> int:
-        return len(self._indexed_doc_ids())
-
-    def _indexed_doc_ids(self) -> list[str]:
+    def count_documents(self, index: str = DEFAULT_INDEX) -> int:
+        validate_index_name(index)
         with self._lock:
-            _, id_map = self._read_index()
-            return list(id_map.values())
+            return len(self._read(index).docs)
 
     def embedding_model_name(self) -> str:
         return MODEL_NAME
+
+
+def _copy_metadata(metadata: dict) -> dict:
+    # Values are scalars or lists of scalars, so copying the lists makes
+    # this a full copy: callers can't reach into the cached state.
+    return {k: list(v) if isinstance(v, list) else v for k, v in metadata.items()}
+
+
+def _public(doc: dict) -> dict:
+    return {"doc_id": doc["doc_id"], "text": doc["text"], "metadata": _copy_metadata(doc["metadata"])}
 
 
 def _normalize_etag(etag: str | None) -> str:

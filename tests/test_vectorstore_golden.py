@@ -13,7 +13,15 @@ import threading
 import pytest
 
 from tests.fakes import FakeEmbedder, FakeMinioClient
-from vectorstore.core import INDEX_OBJ, MAX_PAGE_SIZE, MAX_TOP_K, VectorStore
+from vectorstore.core import (
+    DEFAULT_INDEX,
+    MAX_PAGE_SIZE,
+    MAX_TOP_K,
+    VectorStore,
+    index_object_key,
+)
+
+INDEX_OBJ = index_object_key(DEFAULT_INDEX)
 
 
 @pytest.fixture
@@ -23,7 +31,7 @@ def store():
 
 def test_add_and_get_document(store):
     store.add_document("doc-1", "hello world")
-    assert store.get_document("doc-1") == {"doc_id": "doc-1", "text": "hello world"}
+    assert store.get_document("doc-1") == {"doc_id": "doc-1", "text": "hello world", "metadata": {}}
 
 
 def test_get_missing_document_returns_none(store):
@@ -108,7 +116,7 @@ def test_embedding_model_name_is_exact(store):
 
 @pytest.mark.parametrize(
     "bad_doc_id",
-    ["", "has/slash", "index.v2.bin", "faiss.index", "index.ids.json", "x" * 513],
+    ["", "has/slash", "x" * 513],
 )
 def test_add_document_rejects_invalid_doc_id(store, bad_doc_id):
     with pytest.raises(ValueError):
@@ -146,7 +154,7 @@ def test_add_documents_batch_is_searchable_and_counted(store):
     assert store.add_documents([("a", "alpha"), ("b", "beta"), ("c", "gamma")]) == 3
     assert store.count_documents() == 3
     assert store.search("beta", top_k=1) == ["b"]
-    assert store.get_document("c") == {"doc_id": "c", "text": "gamma"}
+    assert store.get_document("c") == {"doc_id": "c", "text": "gamma", "metadata": {}}
 
 
 def test_add_documents_writes_index_once():
@@ -220,12 +228,6 @@ def test_cache_picks_up_writes_from_another_process():
     assert reader.search("second", top_k=10) == []
 
 
-def test_index_rebuilt_when_index_objects_go_missing(store):
-    store.add_documents([("a", "alpha"), ("b", "beta")])
-    store._client.remove_object(store._bucket, INDEX_OBJ)
-    assert sorted(store.search("alpha", top_k=10)) == ["a", "b"]
-
-
 # -- bounds ----------------------------------------------------------------
 
 
@@ -241,35 +243,6 @@ def test_list_documents_rejects_out_of_range_paging(store, skip, limit):
 
 
 # -- index format ----------------------------------------------------------
-
-
-def test_index_is_a_single_object(store):
-    store.add_documents([("a", "alpha"), ("b", "beta")])
-    names = set(store._client.objects[store._bucket])
-    assert INDEX_OBJ in names
-    assert not names & {"faiss.index", "index.ids.json"}
-
-
-def test_index_blob_round_trips(store):
-    store.add_documents([("a", "alpha"), ("b", "beta")])
-    blob = store._client.objects[store._bucket][INDEX_OBJ]
-    index, id_map = VectorStore._decode_index(blob)
-    assert index.ntotal == 2
-    assert sorted(id_map.values()) == ["a", "b"]
-
-
-def test_legacy_two_object_layout_is_migrated(store):
-    # A bucket written by the pre-v2 code: per-doc objects plus the old
-    # faiss.index / index.ids.json pair, and no index.v2.bin.
-    store.add_documents([("a", "alpha"), ("b", "beta")])
-    objects = store._client.objects[store._bucket]
-    del objects[INDEX_OBJ]
-    objects["faiss.index"] = b"legacy"
-    objects["index.ids.json"] = b"{}"
-    fresh = VectorStore(store._client, FakeEmbedder())
-    assert fresh.search("alpha", top_k=1) == ["a"]
-    assert INDEX_OBJ in objects
-    assert "faiss.index" not in objects and "index.ids.json" not in objects
 
 
 def test_unrecognised_index_blob_is_an_error(store):
@@ -312,11 +285,8 @@ def test_search_matches_search_with_scores_order(store):
 # -- performance-shaped behaviour -------------------------------------------
 
 
-def test_bulk_spanning_several_embed_chunks_keeps_ids_aligned(store, monkeypatch):
-    from vectorstore import core
-
-    monkeypatch.setattr(core, "EMBED_CHUNK_SIZE", 4)
-    docs = [(f"d{i}", f"text {i}") for i in range(11)]  # 3 chunks, last one partial
+def test_bulk_keeps_vectors_aligned_with_their_ids(store):
+    docs = [(f"d{i}", f"text {i}") for i in range(11)]
     assert store.add_documents(docs) == 11
     for i in (0, 3, 4, 7, 10):
         assert store.search(f"text {i}", top_k=1) == [f"d{i}"]
@@ -332,24 +302,6 @@ def test_list_and_count_read_the_cached_index_not_the_bucket():
     assert store.count_documents() == 3
     assert [d["doc_id"] for d in store.list_documents(skip=1, limit=5)] == ["b", "c"]
     assert listed == []
-
-
-def test_upload_failure_in_bulk_leaves_index_untouched():
-    client = FakeMinioClient()
-    store = VectorStore(client, FakeEmbedder())
-    store.add_document("keep", "kept text")
-    real_put = client.put_object
-
-    def flaky_put(bucket, key, data, length):
-        if key == "boom.meta.json":
-            raise RuntimeError("upload failed")
-        return real_put(bucket, key, data, length)
-
-    client.put_object = flaky_put
-    with pytest.raises(RuntimeError):
-        store.add_documents([("ok", "fine"), ("boom", "bad")])
-    assert store.search("fine", top_k=10) == ["keep"]
-    assert store.count_documents() == 1
 
 
 # -- concurrent writers (compare-and-swap index updates) --------------------
@@ -504,31 +456,6 @@ def test_deleting_last_doc_keeps_an_empty_index_object(store):
     assert store.search("next text", top_k=5) == ["next"]
 
 
-def test_bootstrap_from_stale_listing_cannot_replace_a_real_index():
-    # b doesn't see the index at load time (as if it raced a creator) and
-    # builds one from a vector listing that still has a deleted doc. Its
-    # write is create-only, so it loses and b uses the real index instead.
-    client = FakeMinioClient()
-    a = VectorStore(client, FakeEmbedder())
-    a.add_documents([("keep", "k"), ("gone", "g")])
-    stale_vec = client.objects[a._bucket]["gone.npy"]
-    a.delete_document("gone")
-    client.objects[a._bucket]["gone.npy"] = stale_vec  # stale listing
-
-    b = VectorStore(client, FakeEmbedder())
-    real_load = b._load_index
-    hidden = {"once": True}
-
-    def load_hiding_index_once():
-        if hidden["once"]:
-            hidden["once"] = False
-            return None, {}, None
-        return real_load()
-
-    b._load_index = load_hiding_index_once
-    assert b.search("k", top_k=10) == ["keep"]
-
-
 def test_concurrent_first_writes_to_an_empty_bucket_both_land():
     client = FakeMinioClient()
     a = VectorStore(client, FakeEmbedder())
@@ -602,3 +529,344 @@ def test_missing_etag_on_read_is_a_hard_error():
     fresh = VectorStore(client, FakeEmbedder())
     with pytest.raises(RuntimeError, match="no ETag"):
         fresh.search("x text", top_k=1)
+
+
+# -- metadata & filtered search ----------------------------------------------
+
+
+def _corpus(store, index=DEFAULT_INDEX):
+    docs = [
+        ("en-old", "apples and pears", {"lang": "en", "year": 2001, "tags": ["fruit"]}),
+        ("en-new", "apples and oranges", {"lang": "en", "year": 2024, "tags": ["fruit", "citrus"]}),
+        ("de-new", "Äpfel und Birnen", {"lang": "de", "year": 2023}),
+        ("plain", "no metadata here", None),
+    ]
+    store.add_documents(docs, index=index)
+    return docs
+
+
+def test_metadata_round_trips_through_get_list_and_search(store):
+    _corpus(store)
+    assert store.get_document("en-new")["metadata"] == {"lang": "en", "year": 2024, "tags": ["fruit", "citrus"]}
+    assert store.get_document("plain")["metadata"] == {}
+    listed = {d["doc_id"]: d["metadata"] for d in store.list_documents()}
+    assert listed["de-new"] == {"lang": "de", "year": 2023}
+    top = store.search_with_scores("apples and oranges", top_k=1)[0]
+    assert top["doc_id"] == "en-new" and top["metadata"]["year"] == 2024
+
+
+@pytest.mark.parametrize(
+    "flt,expected",
+    [
+        ({"lang": "en"}, {"en-old", "en-new"}),
+        ({"year": {"$gte": 2023}}, {"en-new", "de-new"}),
+        ({"tags": "citrus"}, {"en-new"}),
+        ({"lang": {"$ne": "en"}}, {"de-new", "plain"}),
+        ({"$or": [{"lang": "de"}, {"year": {"$lt": 2010}}]}, {"de-new", "en-old"}),
+        ({"year": {"$exists": False}}, {"plain"}),
+        ({"lang": "fr"}, set()),
+    ],
+)
+def test_filtered_search_returns_only_matching_docs(store, flt, expected):
+    _corpus(store)
+    assert set(store.search("apples", top_k=10, filter=flt)) == expected
+
+
+def test_filtered_search_is_the_exact_top_k_among_matches(store):
+    import numpy as np
+
+    emb = FakeEmbedder()
+    docs = [(f"d{i}", f"text {i}", {"parity": i % 2}) for i in range(40)]
+    store.add_documents(docs)
+    q = emb.encode(["query"])[0]
+    odd = [(d, t) for d, t, m in docs if m["parity"] == 1]
+    expected = sorted(odd, key=lambda dt: -float(np.dot(q, emb.encode([dt[1]])[0])))[:5]
+    assert store.search("query", top_k=5, filter={"parity": 1}) == [d for d, _ in expected]
+
+
+def test_upsert_replaces_metadata(store):
+    store.add_document("x", "text", {"v": 1})
+    store.add_document("x", "text", {"v": 2})
+    assert store.search("text", top_k=5, filter={"v": 1}) == []
+    assert store.search("text", top_k=5, filter={"v": 2}) == ["x"]
+
+
+def test_invalid_filter_is_rejected(store):
+    store.add_document("x", "text")
+    with pytest.raises(ValueError):
+        store.search("text", top_k=5, filter={"v": {"$regex": "."}})
+
+
+def test_bad_metadata_rejects_whole_batch(store):
+    with pytest.raises(ValueError):
+        store.add_documents([("ok", "fine", {"a": 1}), ("bad", "nope", {"a": {"nested": True}})])
+    assert store.count_documents() == 0
+
+
+# -- named indexes -------------------------------------------------------------
+
+
+def test_default_index_always_listed_and_others_created_explicitly(store):
+    from vectorstore.core import IndexAlreadyExistsError
+
+    assert store.list_indexes() == ["default"]
+    store.create_index("papers")
+    store.create_index("notes-2024")
+    assert store.list_indexes() == ["default", "notes-2024", "papers"]
+    with pytest.raises(IndexAlreadyExistsError):
+        store.create_index("papers")
+    with pytest.raises(IndexAlreadyExistsError):
+        store.create_index("default")
+
+
+@pytest.mark.parametrize("bad", ["", "Upper", "under_score", "-lead", "trail-", "a" * 64, "has/slash", "dot.ted"])
+def test_invalid_index_names_are_rejected(store, bad):
+    with pytest.raises(ValueError):
+        store.create_index(bad)
+
+
+def test_indexes_are_isolated(store):
+    store.create_index("other")
+    store.add_document("same-id", "in default")
+    store.add_document("same-id", "in other", {"where": "other"}, index="other")
+    assert store.get_document("same-id")["text"] == "in default"
+    assert store.get_document("same-id", index="other")["text"] == "in other"
+    assert store.count_documents() == 1 and store.count_documents(index="other") == 1
+    assert store.search("in other", top_k=5, filter={"where": "other"}) == []
+    assert store.search("in other", top_k=5, index="other", filter={"where": "other"}) == ["same-id"]
+    store.delete_document("same-id", index="other")
+    assert store.get_document("same-id")["text"] == "in default"
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        lambda s: s.add_document("x", "t", index="nope"),
+        lambda s: s.get_document("x", index="nope"),
+        lambda s: s.list_documents(index="nope"),
+        lambda s: s.count_documents(index="nope"),
+        lambda s: s.delete_document("x", index="nope"),
+        lambda s: s.search("t", index="nope"),
+        lambda s: s.delete_index("nope"),
+    ],
+)
+def test_missing_index_raises_not_found_and_is_not_created(store, op):
+    from vectorstore.core import IndexNotFoundError
+
+    with pytest.raises(IndexNotFoundError):
+        op(store)
+    assert store.list_indexes() == ["default"]
+
+
+def test_delete_index_removes_it_and_its_documents(store):
+    from vectorstore.core import IndexNotFoundError
+
+    store.create_index("tmp")
+    store.add_document("x", "t", index="tmp")
+    store.delete_index("tmp")
+    assert store.list_indexes() == ["default"]
+    with pytest.raises(IndexNotFoundError):
+        store.get_document("x", index="tmp")
+    store.create_index("tmp")  # re-created empty
+    assert store.count_documents(index="tmp") == 0
+
+
+def test_default_index_cannot_be_deleted(store):
+    with pytest.raises(ValueError):
+        store.delete_index("default")
+
+
+def test_writer_losing_to_index_delete_does_not_resurrect_it():
+    from vectorstore.core import IndexNotFoundError
+
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+    a.create_index("tmp")
+    a.add_document("x", "t", index="tmp")
+    key = index_object_key("tmp")
+    real_put = client._put_object
+
+    def b_deletes_index_first(bucket, k, data, headers):
+        if k == key:
+            client._put_object = real_put
+            b.delete_index("tmp")
+        return real_put(bucket, k, data, headers)
+
+    client._put_object = b_deletes_index_first
+    with pytest.raises(IndexNotFoundError):
+        a.add_document("y", "t2", index="tmp")
+    assert key not in client.objects[a._bucket]
+
+
+# -- same-doc_id races are now consistent --------------------------------------
+
+
+def _race(client, key, other_action):
+    """Run other_action() just before the next conditional PUT to `key`."""
+    real_put = client._put_object
+
+    def wrapped(bucket, k, data, headers):
+        if k == key:
+            client._put_object = real_put
+            other_action()
+        return real_put(bucket, k, data, headers)
+
+    client._put_object = wrapped
+
+
+def test_concurrent_writes_to_same_doc_id_keep_text_metadata_and_vector_together():
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+    a.add_document("x", "original", {"v": 0})
+    _race(client, INDEX_OBJ, lambda: b.add_document("x", "from b", {"v": "b"}))
+    a.add_document("x", "from a", {"v": "a"})  # loses, retries on top of b's write
+
+    fresh = VectorStore(client, FakeEmbedder())
+    doc = fresh.get_document("x")
+    assert doc == {"doc_id": "x", "text": "from a", "metadata": {"v": "a"}}
+    top = fresh.search_with_scores("from a", top_k=1)[0]  # the vector is a's too
+    assert top["doc_id"] == "x" and top["score"] == pytest.approx(1.0, abs=1e-5)
+    assert fresh.count_documents() == 1
+
+
+def test_add_racing_delete_of_same_doc_id_ends_consistent():
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+    a.add_document("x", "v1")
+    _race(client, INDEX_OBJ, lambda: b.delete_document("x"))
+    a.add_document("x", "v2")
+    fresh = VectorStore(client, FakeEmbedder())
+    assert fresh.get_document("x")["text"] == "v2"
+    assert fresh.search("v2", top_k=5) == ["x"]
+
+
+# -- guards ------------------------------------------------------------------------
+
+
+def test_doc_id_hash_collision_is_detected_not_overwritten(store, monkeypatch):
+    from vectorstore import core
+
+    monkeypatch.setattr(core, "object_key_id", lambda doc_id: 42)
+    store.add_document("first", "first text")
+    with pytest.raises(ValueError, match="collides"):
+        store.add_document("second", "second text")
+    assert store.get_document("first")["text"] == "first text"
+    assert store.count_documents() == 1
+
+
+def test_embedding_dimension_mismatch_is_rejected():
+    client = FakeMinioClient()
+    VectorStore(client, FakeEmbedder()).add_document("x", "t")
+
+    class SmallerEmbedder(FakeEmbedder):
+        dim = 4
+
+    with pytest.raises(ValueError, match="dimension"):
+        VectorStore(client, SmallerEmbedder()).add_document("y", "t")
+
+
+def test_index_blob_round_trips(store):
+    from vectorstore.core import _IndexState
+
+    _corpus(store)
+    state = _IndexState.decode(store._client.objects[store._bucket][INDEX_OBJ], INDEX_OBJ)
+    assert state.faiss.ntotal == 4 and sorted(state.by_id) == ["de-new", "en-new", "en-old", "plain"]
+    assert state.docs[state.by_id["en-old"]]["metadata"]["year"] == 2001
+
+
+def test_index_is_a_single_object_with_no_per_doc_objects(store):
+    _corpus(store)
+    assert set(store._client.objects[store._bucket]) == {INDEX_OBJ}
+
+
+# -- migration from older layouts ---------------------------------------------------
+
+
+def _legacy_bucket(docs, v2_live=None, vector_only=(), text_only=()):
+    """A bucket as the pre-v3 code left it: per-doc .npy/.meta.json, plus an
+    index.v2.bin listing `v2_live` doc_ids if given (else no index: v1/none)."""
+    import json
+    import struct
+
+    import faiss
+    import numpy as np
+
+    from vectorstore import core
+
+    client = FakeMinioClient()
+    client.make_bucket("vectors")
+    objs = client.objects["vectors"]
+    emb = FakeEmbedder()
+    for doc_id, text in docs:
+        objs[f"{doc_id}.npy"] = emb.encode([text])[0].tobytes()
+        objs[f"{doc_id}.meta.json"] = json.dumps({"doc_id": doc_id, "text": text}).encode()
+    for doc_id in vector_only:
+        objs[f"{doc_id}.npy"] = emb.encode(["orphan"])[0].tobytes()
+    for doc_id in text_only:
+        objs[f"{doc_id}.meta.json"] = json.dumps({"doc_id": doc_id, "text": "orphan"}).encode()
+    if v2_live is not None:
+        idx = faiss.IndexIDMap2(faiss.IndexFlatL2(emb.dim))
+        keys = [core.object_key_id(d) for d in v2_live]
+        vecs = np.vstack([np.frombuffer(objs[f"{d}.npy"], dtype=np.float32) for d in v2_live])
+        idx.add_with_ids(vecs, np.array(keys, dtype="int64"))
+        ids_json = json.dumps({str(k): d for k, d in zip(keys, v2_live)}).encode()
+        objs["index.v2.bin"] = b"".join(
+            (b"S3VAH-IDX\x01", struct.pack(">Q", len(ids_json)), ids_json, faiss.serialize_index(idx).tobytes())
+        )
+    return client
+
+
+def test_migrates_v2_layout_into_default_index():
+    client = _legacy_bucket([("a", "alpha"), ("b", "beta"), ("stale", "not in v2 index")], v2_live=["a", "b"])
+    legacy = dict(client.objects["vectors"])
+    store = VectorStore(client, FakeEmbedder())
+    assert sorted(d["doc_id"] for d in store.list_documents()) == ["a", "b"]  # v2 index decides what's live
+    assert store.get_document("a") == {"doc_id": "a", "text": "alpha", "metadata": {}}
+    assert store.search("beta", top_k=1) == ["b"]
+    objs = client.objects["vectors"]
+    assert INDEX_OBJ in objs
+    assert all(objs[k] == v for k, v in legacy.items())  # legacy objects left untouched
+
+
+def test_migrates_v1_or_index_less_layout_skipping_half_written_docs():
+    client = _legacy_bucket([("a", "alpha"), ("b", "beta")], vector_only=["vec-only"], text_only=["text-only"])
+    store = VectorStore(client, FakeEmbedder())
+    assert sorted(d["doc_id"] for d in store.list_documents()) == ["a", "b"]
+    assert store.search("alpha", top_k=1) == ["a"]
+
+
+def test_migration_runs_once():
+    client = _legacy_bucket([("a", "alpha")])
+    VectorStore(client, FakeEmbedder()).count_documents()
+    client.objects["vectors"]["late.npy"] = FakeEmbedder().encode(["late"])[0].tobytes()
+    client.objects["vectors"]["late.meta.json"] = b'{"doc_id": "late", "text": "late"}'
+    assert VectorStore(client, FakeEmbedder()).count_documents() == 1
+
+
+def test_concurrent_migrations_keep_exactly_one_result():
+    client = _legacy_bucket([("a", "alpha"), ("b", "beta")])
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+    _race(client, INDEX_OBJ, lambda: b.add_document("c", "gamma"))  # b migrates + writes first
+    assert a.count_documents() == 3  # a's create loses; it reads b's migrated index
+    assert sorted(d["doc_id"] for d in a.list_documents()) == ["a", "b", "c"]
+
+
+def test_empty_bucket_gets_an_empty_default_index(store):
+    assert store.count_documents() == 0
+    assert INDEX_OBJ in store._client.objects[store._bucket]
+
+
+def test_returned_metadata_is_a_copy_not_the_cached_state(store):
+    # Callers editing what they got back must not change what later reads
+    # (served from the in-memory cache) return.
+    store.add_document("x", "text", {"tags": ["a"], "v": 1})
+    store.search_with_scores("text", top_k=1)[0]["metadata"]["v"] = 99
+    store.get_document("x")["metadata"]["v"] = 98
+    store.list_documents()[0]["metadata"]["v"] = 97
+    assert store.get_document("x")["metadata"] == {"tags": ["a"], "v": 1}
+    store.get_document("x")["metadata"]["tags"].append("b")
+    assert store.get_document("x")["metadata"]["tags"] == ["a"]

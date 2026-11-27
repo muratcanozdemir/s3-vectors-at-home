@@ -76,3 +76,36 @@ def test_index_write_conflict_maps_to_503(monkeypatch):
     r = client.post("/upload", json={"doc_id": "x", "text": "y"})
     assert r.status_code == 503
     assert r.headers["retry-after"] == "1"
+
+
+def test_metadata_filter_and_named_indexes_over_http():
+    import uuid
+
+    name = f"api-{uuid.uuid4().hex[:8]}"
+    r = client.post("/indexes", json={"name": name})
+    assert r.status_code == 201
+    assert client.post("/indexes", json={"name": name}).status_code == 409
+    assert name in client.get("/indexes").json()["indexes"]
+    try:
+        base = f"/indexes/{name}"
+        r = client.post(f"{base}/upload/bulk", json={"docs": [
+            {"doc_id": "en", "text": "a guide to sourdough bread", "metadata": {"lang": "en", "year": 2024}},
+            {"doc_id": "de", "text": "ein Leitfaden für Sauerteigbrot", "metadata": {"lang": "de", "year": 2020}},
+        ]})
+        assert r.status_code == 200 and r.json()["count"] == 2
+        r = client.post(f"{base}/search", json={"query": "sourdough", "top_k": 5, "filter": {"lang": "de"}})
+        assert r.json()["matches"] == ["de"]
+        assert r.json()["results"][0]["metadata"] == {"lang": "de", "year": 2020}
+        assert client.get(f"{base}/document/en").json()["metadata"]["year"] == 2024
+        assert client.get(f"{base}/status").json()["document_count"] == 2
+        assert client.get("/document/en").status_code in (200, 404)  # default index is separate
+        assert client.post(f"{base}/search", json={"query": "x", "filter": {"lang": {"$regex": "."}}}).status_code == 400
+        assert client.post(f"{base}/upload", json={"doc_id": "bad", "text": "t", "metadata": {"a": {"b": 1}}}).status_code == 400
+        assert client.delete(f"{base}/document/en").status_code == 200
+        assert client.delete(f"{base}/document/en").status_code == 404
+    finally:
+        assert client.delete(f"/indexes/{name}").status_code == 200
+    assert client.get(f"/indexes/{name}/documents").status_code == 404
+    assert client.post(f"/indexes/{name}/upload", json={"doc_id": "x", "text": "t"}).status_code == 404
+    assert client.delete("/indexes/default").status_code == 400
+    assert client.post("/indexes", json={"name": "Bad_Name"}).status_code == 400
