@@ -2,7 +2,7 @@ import argparse
 import json
 import sys
 
-from vectorstore.core import get_store
+from vectorstore.core import IndexWriteConflictError, get_store
 
 
 def cmd_upload(args):
@@ -117,7 +117,11 @@ def main():
     st.set_defaults(func=cmd_status)
 
     args = ap.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except IndexWriteConflictError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

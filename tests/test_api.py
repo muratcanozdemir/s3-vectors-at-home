@@ -63,3 +63,16 @@ def test_count_documents_consistent():
     count = resp.json()["document_count"]
     resp2 = client.get("/documents")
     assert count == len(resp2.json()["documents"])
+
+
+def test_index_write_conflict_maps_to_503(monkeypatch):
+    from vectorstore import core
+
+    class Conflicted:
+        def add_document(self, *a, **k):
+            raise core.IndexWriteConflictError("busy")
+
+    monkeypatch.setattr("api.main.get_store", lambda: Conflicted())
+    r = client.post("/upload", json={"doc_id": "x", "text": "y"})
+    assert r.status_code == 503
+    assert r.headers["retry-after"] == "1"

@@ -152,16 +152,16 @@ def test_add_documents_batch_is_searchable_and_counted(store):
 def test_add_documents_writes_index_once():
     client = FakeMinioClient()
     store = VectorStore(client, FakeEmbedder())
-    puts = []
-    real_put = client.put_object
+    index_puts = []
+    real_put = client._put_object
 
-    def counting_put(bucket, key, data, length):
-        puts.append(key)
-        return real_put(bucket, key, data, length)
+    def counting_put(bucket, key, data, headers):
+        index_puts.append(key)
+        return real_put(bucket, key, data, headers)
 
-    client.put_object = counting_put
+    client._put_object = counting_put
     store.add_documents([(f"d{i}", f"text {i}") for i in range(10)])
-    assert puts.count(INDEX_OBJ) == 1
+    assert index_puts.count(INDEX_OBJ) == 1
 
 
 def test_add_documents_rejects_whole_batch_on_invalid_id(store):
@@ -350,3 +350,255 @@ def test_upload_failure_in_bulk_leaves_index_untouched():
         store.add_documents([("ok", "fine"), ("boom", "bad")])
     assert store.search("fine", top_k=10) == ["keep"]
     assert store.count_documents() == 1
+
+
+# -- concurrent writers (compare-and-swap index updates) --------------------
+# Two VectorStores over one FakeMinioClient stand in for two processes:
+# separate locks and caches, coordinated only through the object store.
+
+
+def _intercept_index_puts(client, before_put):
+    """Run before_put(n) just before the n-th (0-based) conditional index PUT."""
+    real = client._put_object
+    calls = {"n": 0}
+
+    def wrapped(bucket, key, data, headers):
+        if key == INDEX_OBJ:
+            n = calls["n"]
+            calls["n"] += 1
+            before_put(n)
+        return real(bucket, key, data, headers)
+
+    client._put_object = wrapped
+    return calls
+
+
+def test_lost_race_is_retried_on_top_of_the_winner():
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+    a.add_document("base", "base text")
+    b.search("base text", top_k=1)  # b now caches the same index version
+
+    # Right before a's next index PUT, b commits its own update. a's PUT
+    # carries the now-stale ETag, so it must be rejected and redone.
+    def b_sneaks_in(n):
+        if n == 0:
+            client._put_object = real_put
+            b.add_document("from-b", "b text")
+            client._put_object = wrapped
+
+    real_put = client._put_object
+    _intercept_index_puts(client, b_sneaks_in)
+    wrapped = client._put_object
+    a.add_document("from-a", "a text")
+
+    fresh = VectorStore(client, FakeEmbedder())
+    assert sorted(d["doc_id"] for d in fresh.list_documents()) == ["base", "from-a", "from-b"]
+    assert sorted(fresh.search("a text", top_k=10)) == ["base", "from-a", "from-b"]
+
+
+def test_delete_racing_an_add_keeps_both_effects():
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+    a.add_documents([("keep", "k"), ("gone", "g")])
+
+    def b_adds(n):
+        if n == 0:
+            client._put_object = real_put
+            b.add_document("new", "n")
+            client._put_object = wrapped
+
+    real_put = client._put_object
+    _intercept_index_puts(client, b_adds)
+    wrapped = client._put_object
+    assert a.delete_document("gone")
+
+    fresh = VectorStore(client, FakeEmbedder())
+    assert sorted(d["doc_id"] for d in fresh.list_documents()) == ["keep", "new"]
+
+
+def test_write_applied_but_reported_as_conflict_is_idempotent():
+    # The PUT lands, but the client sees a 412 -- e.g. the response was
+    # lost and urllib3's automatic retry of the PUT hit our own new ETag.
+    # Re-applying the edit on top of its own effect must be harmless.
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("x", "x text")
+    real = client._put_object
+    state = {"armed": True}
+
+    def apply_then_conflict(bucket, key, data, headers):
+        result = real(bucket, key, data, headers)
+        if key == INDEX_OBJ and state["armed"]:
+            state["armed"] = False
+            from tests.fakes import _s3_error
+
+            raise _s3_error("PreconditionFailed", bucket, key)
+        return result
+
+    client._put_object = apply_then_conflict
+    store.add_document("y", "y text")
+    assert sorted(store.search("y text", top_k=10)) == ["x", "y"]  # no duplicate y
+
+    state["armed"] = True
+    assert store.delete_document("y")
+    fresh = VectorStore(client, FakeEmbedder())
+    assert fresh.search("x text", top_k=10) == ["x"]
+
+
+def test_gives_up_after_bounded_retries_without_corrupting(monkeypatch):
+    from tests.fakes import _s3_error
+    from vectorstore import core
+
+    monkeypatch.setattr(core, "INDEX_WRITE_ATTEMPTS", 3)
+    monkeypatch.setattr(core, "INDEX_WRITE_BACKOFF_BASE_S", 0)
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("x", "x text")
+    real = client._put_object
+    attempts = []
+
+    def always_conflict(bucket, key, data, headers):
+        if key == INDEX_OBJ:
+            attempts.append(1)
+            raise _s3_error("PreconditionFailed", bucket, key)
+        return real(bucket, key, data, headers)
+
+    client._put_object = always_conflict
+    with pytest.raises(core.IndexWriteConflictError):
+        store.add_document("y", "y text")
+    assert len(attempts) == 3
+    client._put_object = real
+    assert store.search("y text", top_k=10) == ["x"]  # index untouched by the failed write
+
+
+def test_non_conflict_put_error_propagates_and_drops_cache():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("x", "x text")
+    real = client._put_object
+
+    def broken(bucket, key, data, headers):
+        if key == INDEX_OBJ:
+            raise ConnectionError("network down")
+        return real(bucket, key, data, headers)
+
+    client._put_object = broken
+    with pytest.raises(ConnectionError):
+        store.add_document("y", "y text")
+    client._put_object = real
+    # The in-memory index was mutated before the failed PUT; it must not
+    # be served as if it were the stored version.
+    assert store.search("y text", top_k=10) == ["x"]
+
+
+def test_deleting_last_doc_keeps_an_empty_index_object(store):
+    store.add_document("only", "only text")
+    store.delete_document("only")
+    assert INDEX_OBJ in store._client.objects[store._bucket]
+    assert store.search("only text", top_k=5) == []
+    assert store.count_documents() == 0
+    store.add_document("next", "next text")
+    assert store.search("next text", top_k=5) == ["next"]
+
+
+def test_bootstrap_from_stale_listing_cannot_replace_a_real_index():
+    # b doesn't see the index at load time (as if it raced a creator) and
+    # builds one from a vector listing that still has a deleted doc. Its
+    # write is create-only, so it loses and b uses the real index instead.
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    a.add_documents([("keep", "k"), ("gone", "g")])
+    stale_vec = client.objects[a._bucket]["gone.npy"]
+    a.delete_document("gone")
+    client.objects[a._bucket]["gone.npy"] = stale_vec  # stale listing
+
+    b = VectorStore(client, FakeEmbedder())
+    real_load = b._load_index
+    hidden = {"once": True}
+
+    def load_hiding_index_once():
+        if hidden["once"]:
+            hidden["once"] = False
+            return None, {}, None
+        return real_load()
+
+    b._load_index = load_hiding_index_once
+    assert b.search("k", top_k=10) == ["keep"]
+
+
+def test_concurrent_first_writes_to_an_empty_bucket_both_land():
+    client = FakeMinioClient()
+    a = VectorStore(client, FakeEmbedder())
+    b = VectorStore(client, FakeEmbedder())
+
+    def b_creates_first(n):
+        if n == 0:
+            client._put_object = real_put
+            b.add_document("from-b", "b text")
+            client._put_object = wrapped
+
+    real_put = client._put_object
+    _intercept_index_puts(client, b_creates_first)
+    wrapped = client._put_object
+    a.add_document("from-a", "a text")  # its If-None-Match: * create must lose, then retry
+    fresh = VectorStore(client, FakeEmbedder())
+    assert sorted(d["doc_id"] for d in fresh.list_documents()) == ["from-a", "from-b"]
+
+
+# -- startup checks ------------------------------------------------------------
+
+
+def test_refuses_backend_that_ignores_conditional_writes():
+    from vectorstore.core import ConditionalWritesUnsupportedError
+
+    client = FakeMinioClient(enforce_conditions=False)
+    with pytest.raises(ConditionalWritesUnsupportedError):
+        VectorStore(client, FakeEmbedder())
+    assert client.objects["vectors"] == {}  # probe cleaned up after itself
+
+
+def test_probe_leaves_no_objects_behind(store):
+    assert store._client.objects[store._bucket] == {}
+
+
+def test_losing_bucket_creation_race_is_fine():
+    from tests.fakes import _s3_error
+
+    client = FakeMinioClient()
+
+    def already_created(bucket):
+        client.buckets.add(bucket)
+        client.objects.setdefault(bucket, {})
+        raise _s3_error("BucketAlreadyOwnedByYou", bucket, "")
+
+    client.make_bucket = already_created
+    VectorStore(client, FakeEmbedder()).add_document("x", "x")
+
+
+def test_bucket_owned_by_someone_else_is_an_error():
+    from minio.error import S3Error
+
+    from tests.fakes import _s3_error
+
+    client = FakeMinioClient()
+
+    def taken(bucket):
+        raise _s3_error("BucketAlreadyExists", bucket, "")
+
+    client.make_bucket = taken
+    with pytest.raises(S3Error):
+        VectorStore(client, FakeEmbedder())
+
+
+def test_missing_etag_on_read_is_a_hard_error():
+    client = FakeMinioClient()
+    store = VectorStore(client, FakeEmbedder())
+    store.add_document("x", "x text")
+    real_stat = client.stat_object
+    client.stat_object = lambda b, k: real_stat(b, k)._replace(etag="")
+    fresh = VectorStore(client, FakeEmbedder())
+    with pytest.raises(RuntimeError, match="no ETag"):
+        fresh.search("x text", top_k=1)
