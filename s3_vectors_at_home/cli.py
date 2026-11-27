@@ -17,16 +17,17 @@ def cmd_upload(args):
 def cmd_bulk_upload(args):
     with open(args.file, "r", encoding="utf-8") as f:
         docs = json.load(f)
-    assert isinstance(docs, list), "Bulk file should be a JSON list of {doc_id, text}"
-    store = get_store()
-    for doc in docs:
-        try:
-            store.add_document(doc["doc_id"], doc["text"])
-        except ValueError as e:
-            print(f"Error uploading {doc.get('doc_id')!r}: {e}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Uploaded {doc['doc_id']}")
-    print(f"Bulk uploaded {len(docs)} documents.")
+    if not isinstance(docs, list) or not all(
+        isinstance(d, dict) and "doc_id" in d and "text" in d for d in docs
+    ):
+        print("Error: bulk file must be a JSON list of {doc_id, text} objects", file=sys.stderr)
+        sys.exit(1)
+    try:
+        count = get_store().add_documents((d["doc_id"], d["text"]) for d in docs)
+    except ValueError as e:
+        print(f"Error: {e} (nothing was uploaded)", file=sys.stderr)
+        sys.exit(1)
+    print(f"Bulk uploaded {count} documents.")
 
 
 def cmd_search(args):
@@ -48,7 +49,11 @@ def cmd_get(args):
 
 
 def cmd_list(args):
-    docs = get_store().list_documents(skip=args.skip, limit=args.limit)
+    try:
+        docs = get_store().list_documents(skip=args.skip, limit=args.limit)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     for d in docs:
         print(d["doc_id"], "-", d["text_preview"].replace("\n", " ")[:60])
 

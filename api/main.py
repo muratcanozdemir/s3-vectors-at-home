@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
-from vectorstore.core import get_store
+from vectorstore.core import MAX_PAGE_SIZE, MAX_TOP_K, get_store
 
 app = FastAPI()
 
@@ -17,7 +17,7 @@ class BulkDocUpload(BaseModel):
 
 class SearchRequest(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = Field(5, ge=1, le=MAX_TOP_K)
 
 
 @app.post("/upload")
@@ -31,13 +31,11 @@ def upload_doc(payload: DocUpload):
 
 @app.post("/upload/bulk")
 def upload_bulk(payload: BulkDocUpload):
-    store = get_store()
     try:
-        for doc in payload.docs:
-            store.add_document(doc.doc_id, doc.text)
+        count = get_store().add_documents((doc.doc_id, doc.text) for doc in payload.docs)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"status": "ok", "count": len(payload.docs)}
+    return {"status": "ok", "count": count}
 
 
 @app.get("/document/{doc_id}")
@@ -49,7 +47,7 @@ def get_doc(doc_id: str):
 
 
 @app.get("/documents")
-def list_docs(skip: int = 0, limit: int = 100):
+def list_docs(skip: int = Query(0, ge=0), limit: int = Query(100, ge=0, le=MAX_PAGE_SIZE)):
     return {"documents": get_store().list_documents(skip=skip, limit=limit)}
 
 
