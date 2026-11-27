@@ -3,7 +3,14 @@ services:
     # minio/minio was removed from Docker Hub and quay.io/minio/minio no longer
     # allows anonymous pulls, so use the Chainguard-built MinIO image instead.
     # It runs as non-root (uid 65532), so data lives in a named volume.
-    image: chainguard/minio:latest
+    #
+    # Pinned by digest: Chainguard's free images only publish `latest`, and
+    # the store refuses to start on a MinIO that doesn't enforce conditional
+    # PUTs, so an unpinned `latest` could break CI/dev with no code change.
+    # This digest is MinIO RELEASE.2026-11-23T00-10-37Z, verified with the
+    # concurrency tests. Dependabot (docker-compose) proposes digest bumps;
+    # CI runs the full suite, including the conditional-write probe, on them.
+    image: chainguard/minio:latest@sha256:b288eaa709ba2f799a39e9a8ceda71a08fabf90109b12c90badba9afff29485c
     command: server /data
     environment:
       MINIO_ROOT_USER: minioadmin
