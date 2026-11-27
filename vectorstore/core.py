@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import struct
 import threading
 
 import faiss
@@ -12,9 +13,17 @@ from minio import Minio
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 BUCKET = "vectors"
-INDEX_OBJ = "faiss.index"
-IDS_OBJ = "index.ids.json"
-RESERVED_OBJECT_NAMES = {INDEX_OBJ, IDS_OBJ}
+# The FAISS index and its {int id: doc_id} map live in ONE object, so a
+# single PUT replaces both atomically. (They used to be two objects,
+# written one after the other: a crash or a concurrent writer in between
+# could leave an index whose ids the map didn't match.)
+INDEX_OBJ = "index.v2.bin"
+INDEX_MAGIC = b"S3VAH-IDX\x01"
+# Pre-v2 layout. Never read: a bucket that only has these has no INDEX_OBJ,
+# so the index is rebuilt from the per-document vectors and these are
+# removed. Kept reserved so no doc_id can collide with them.
+LEGACY_INDEX_OBJS = ("faiss.index", "index.ids.json")
+RESERVED_OBJECT_NAMES = {INDEX_OBJ, *LEGACY_INDEX_OBJS}
 MAX_DOC_ID_LENGTH = 512
 MAX_TOP_K = 1000
 MAX_PAGE_SIZE = 1000
@@ -61,8 +70,8 @@ class VectorStore:
     via `add_with_ids`/`remove_ids` -- no full rebuild needed except to
     bootstrap a missing index from the individually-stored vectors.
 
-    The loaded index is cached in memory, keyed by the ETag of the ids
-    object (always written last by `_save_index`). Each read does a cheap
+    The loaded index is cached in memory, keyed by the ETag of the index
+    object. Each read does a cheap
     HEAD (`stat_object`) instead of downloading the whole index; if another
     process has rewritten the index since, the ETag differs and it is
     reloaded. All access to the cached FAISS object happens under
@@ -128,33 +137,50 @@ class VectorStore:
         return self._embed_many([text])[0]
 
     # -- index persistence ------------------------------------------------
-    # faiss.write_index/read_index require a path/FILE*/IOWriter, not a
-    # plain file-like object -- serialize_index/deserialize_index are the
-    # supported way to round-trip an index through an in-memory buffer.
+    # Blob layout: INDEX_MAGIC | u64 big-endian length of ids JSON | ids JSON
+    # | faiss.serialize_index bytes. faiss.write_index/read_index need a
+    # path/FILE*/IOWriter, not a file-like object -- serialize_index /
+    # deserialize_index are the supported in-memory round trip.
+
+    @staticmethod
+    def _encode_index(index, id_map: dict) -> bytes:
+        ids_json = json.dumps({str(k): v for k, v in id_map.items()}).encode()
+        return b"".join(
+            (INDEX_MAGIC, struct.pack(">Q", len(ids_json)), ids_json, faiss.serialize_index(index).tobytes())
+        )
+
+    @staticmethod
+    def _decode_index(blob: bytes):
+        if not blob.startswith(INDEX_MAGIC):
+            raise ValueError(f"{INDEX_OBJ} is not a recognised index blob")
+        pos = len(INDEX_MAGIC)
+        (ids_len,) = struct.unpack_from(">Q", blob, pos)
+        pos += 8
+        id_map = {int(k): v for k, v in json.loads(blob[pos: pos + ids_len]).items()}
+        index = faiss.deserialize_index(np.frombuffer(blob, dtype=np.uint8, offset=pos + ids_len))
+        return index, id_map
 
     def _load_index(self):
         """Returns (IndexIDMap2 or None, {int_id: doc_id}).
 
         Must be called with `self._lock` held. Serves the cached index when
-        the ids object's ETag is unchanged. The ETag is read *before* the
+        the index object's ETag is unchanged. The ETag is read *before* the
         download, so a concurrent writer in another process can only cause
         newer data to be cached under an older ETag -- which just triggers
         one extra reload next time, never a stale read.
         """
-        etag = self._etag(IDS_OBJ)
+        etag = self._etag(INDEX_OBJ)
         if etag is None:
             self._cache = None
             return None, {}
         if self._cache is not None and self._cache[0] == etag:
             return self._cache[1], self._cache[2]
         try:
-            idx_bytes = self._get_bytes(INDEX_OBJ)
-            ids_bytes = self._get_bytes(IDS_OBJ)
+            blob = self._get_bytes(INDEX_OBJ)
         except ObjectNotFoundError:
             self._cache = None
             return None, {}
-        index = faiss.deserialize_index(np.frombuffer(idx_bytes, dtype=np.uint8))
-        id_map = {int(k): v for k, v in json.loads(ids_bytes).items()}
+        index, id_map = self._decode_index(blob)
         self._cache = (etag, index, id_map)
         return index, id_map
 
@@ -163,22 +189,23 @@ class VectorStore:
         # if a write below fails the cache must not keep serving the
         # mutated-but-unpersisted index as if it matched the stored ETag.
         self._cache = None
-        self._put_bytes(INDEX_OBJ, faiss.serialize_index(index).tobytes())
-        etag = self._put_bytes(IDS_OBJ, json.dumps({str(k): v for k, v in id_map.items()}).encode())
+        etag = self._put_bytes(INDEX_OBJ, self._encode_index(index, id_map))
         self._cache = (etag, index, id_map)
 
     def _drop_index(self):
         self._cache = None
         self._delete_object(INDEX_OBJ)
-        self._delete_object(IDS_OBJ)
 
     def _rebuild_index_from_scratch(self, persist: bool = True):
         """Bootstrap the index from the individually-stored vectors.
 
-        Only used when no index exists yet (first write, or a previous
-        index/ids object went missing) -- ordinary add/update/delete mutate
-        the existing index directly instead of paying for this.
+        Only used when no index exists yet (first write, a bucket still on
+        the pre-v2 two-object layout, or the index object went missing) --
+        ordinary add/update/delete mutate the existing index directly
+        instead of paying for this.
         """
+        for legacy in LEGACY_INDEX_OBJS:
+            self._delete_object(legacy)
         vectors, doc_ids = [], []
         for obj in self._client.list_objects(self._bucket):
             if obj.object_name.endswith(".npy"):
