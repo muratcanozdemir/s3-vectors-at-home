@@ -1,5 +1,24 @@
 site_name: s3-vectors-at-home
+repo_url: https://github.com/muratcanozdemir/s3-vectors-at-home
 nav:
   - Home: index.md
+  - Getting started: getting-started.md
+  - Guides:
+      - Text API: text-api.md
+      - Filters: filters.md
+      - S3 Vectors API: s3-vectors.md
+      - CLI: cli.md
+  - Reference:
+      - Configuration: configuration.md
+      - Operations: operations.md
+  - Development: development.md
 plugins:
   - techdocs-core
+# Make `mkdocs build --strict` (CI) fail on broken links and anchors.
+validation:
+  omitted_files: warn
+  absolute_links: info
+  unrecognized_links: warn
+  links:
+    not_found: warn
+    anchors: warn
