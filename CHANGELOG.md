@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0](https://github.com/muratcanozdemir/s3-vectors-at-home/compare/v0.1.1...v0.2.0) (2026-11-28)
+
+
+### Features
+
+* consistent backups to a directory, and verified restores ([#26](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/26)) ([979c515](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/979c5159ad6f01a71083d5e2b09792a2fb5ca9c6))
+
+
+### Performance Improvements
+
+* approximate (HNSW) search and an inverted index for metadata filters ([#25](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/25)) ([a0d5786](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/a0d5786d435f60029cb9e82b4b39b7a1262888a2))
+* split long documents into chunks and cap index memory per worker ([#23](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/23)) ([f591208](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/f591208b06800520c380eb2467d5fcd8d3f2b9fd))
+
 ## [0.1.1](https://github.com/muratcanozdemir/s3-vectors-at-home/compare/v0.1.0...v0.1.1) (2026-11-28)
 
 
