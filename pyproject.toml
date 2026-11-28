@@ -28,3 +28,8 @@ dev = ["pytest", "httpx", "pytest-cov"]
 
 [project.scripts]
 s3-vectors-cli = "s3_vectors_at_home.cli:main"
+
+[tool.hatch.build.targets.wheel]
+# Without this hatchling only packages the directory matching the project
+# name, so the wheel shipped the CLI without the code it imports.
+packages = ["s3_vectors_at_home", "vectorstore", "api"]

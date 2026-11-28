@@ -54,10 +54,41 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Build
         run: uvx hatchling build
+      - name: Install the wheel in a clean venv and run it
+        # Catches a wheel that leaves out packages the CLI imports.
+        run: |
+          uv venv /tmp/wheel-venv
+          VIRTUAL_ENV=/tmp/wheel-venv uv pip install dist/*.whl
+          /tmp/wheel-venv/bin/s3-vectors-cli --help
+          /tmp/wheel-venv/bin/python -c "import api.main, vectorstore.core, vectorstore.embedding"
       - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image and start MinIO + API
+        run: docker compose up -d --build
+      - name: Wait for the API to report healthy
+        # The container's own health check (GET /status) is what `docker ps` and orchestrators see.
+        run: timeout 180 bash -c 'until [ "$(docker inspect -f "{{.State.Health.Status}}" "$(docker compose ps -q api)")" = healthy ]; do sleep 2; done'
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          curl -sf -X POST localhost:8000/upload/bulk -H 'content-type: application/json' \
+            -d '{"docs": [{"doc_id": "cat", "text": "a cat sat on the mat", "metadata": {"kind": "pet"}},
+                          {"doc_id": "rocket", "text": "rocket engine thrust", "metadata": {"kind": "space"}}]}'
+          curl -sf -X POST localhost:8000/search -H 'content-type: application/json' \
+            -d '{"query": "kitten on a rug", "top_k": 1}' | tee /dev/stderr | grep -q '"matches":\["cat"\]'
+          curl -sf -X POST localhost:8000/search -H 'content-type: application/json' \
+            -d '{"query": "kitten on a rug", "filter": {"kind": "space"}}' | grep -q '"matches":\["rocket"\]'
+          test "$(docker compose exec -T api id -u)" = 10001
+      - name: Logs
+        if: failure()
+        run: docker compose logs
 
   publish:
     if: github.event_name == 'release'
@@ -74,3 +105,25 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: uvx twine upload dist/*
+
+  publish-image:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    needs: [image, test, lint]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and push to GitHub Container Registry
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$TAG" -t "$image:$TAG" -t "$image:latest" .
+          docker push "$image:$TAG"
+          docker push "$image:latest"
