@@ -8,11 +8,12 @@ Filters follow the MongoDB-style operators S3 Vectors uses:
     {"lang": "en"}                                   # implicit $eq
     {"year": {"$gte": 2020, "$lt": 2025}}            # several ops on a field: AND
     {"$or": [{"lang": "en"}, {"tags": {"$in": ["a"]}}]}
-Operators: $eq $ne $gt $gte $lt $lte $in $nin $exists, combined with $and,
-$or, or by listing several fields (AND). For a list-valued field, $eq/$in
-match if *any* element matches, and $ne/$nin if *no* element does. Range
-operators compare numbers only. A missing field matches only $ne, $nin and
-{"$exists": false}.
+Operators: $eq $ne $gt $gte $lt $lte $in $nin $exists $startsWith, combined
+with $and, $or, or by listing several fields (AND). For a list-valued field,
+$eq/$in/$startsWith match if *any* element matches, and $ne/$nin if *no*
+element does. Range operators compare numbers only; $startsWith matches
+strings that begin with the given prefix. A missing field matches only $ne,
+$nin and {"$exists": false}.
 
 Booleans are kept distinct from numbers (True does not equal 1), which
 Python's `==` would otherwise conflate.
@@ -27,7 +28,7 @@ MAX_KEY_LENGTH = 64
 MAX_LIST_LENGTH = 64
 MAX_FILTER_DEPTH = 8
 
-_FIELD_OPS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists"}
+_FIELD_OPS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$startsWith"}
 _RANGE_OPS = {"$gt", "$gte", "$lt", "$lte"}
 _LOGICAL_OPS = {"$and", "$or"}
 
@@ -115,6 +116,8 @@ def _validate_op(field: str, op: str, operand) -> None:
             raise ValueError(f"{op} on {field!r} takes a list of strings, numbers or booleans")
     elif op == "$exists" and not isinstance(operand, bool):
         raise ValueError(f"$exists on {field!r} takes true or false")
+    elif op == "$startsWith" and not isinstance(operand, str):
+        raise ValueError(f"$startsWith on {field!r} takes a string")
 
 
 def _eq(a, b) -> bool:
@@ -144,6 +147,8 @@ def _match_op(present: bool, values: list, op: str, operand) -> bool:
         return any(_eq(v, o) for v in values for o in operand)
     if op == "$nin":
         return not any(_eq(v, o) for v in values for o in operand)
+    if op == "$startsWith":
+        return any(isinstance(v, str) and v.startswith(operand) for v in values)
     nums = [v for v in values if _is_number(v)]
     if op == "$gt":
         return any(v > operand for v in nums)
@@ -154,6 +159,32 @@ def _match_op(present: bool, values: list, op: str, operand) -> bool:
     if op == "$lte":
         return any(v <= operand for v in nums)
     raise AssertionError(op)  # unreachable for validated filters
+
+
+def filter_fields(flt: dict) -> set[str]:
+    """The metadata fields a (validated) filter refers to."""
+    fields = set()
+    for key, cond in flt.items():
+        if key in _LOGICAL_OPS:
+            for sub in cond:
+                fields |= filter_fields(sub)
+        else:
+            fields.add(key)
+    return fields
+
+
+def count_constraints(flt: dict) -> int:
+    """Constraints in a (validated) filter, counted as S3 Vectors does: one
+    per operand value, so {"$in": [a, b, c]} counts three."""
+    n = 0
+    for key, cond in flt.items():
+        if key in _LOGICAL_OPS:
+            n += sum(count_constraints(sub) for sub in cond)
+        elif isinstance(cond, dict):
+            n += sum(len(v) if isinstance(v, list) else 1 for v in cond.values())
+        else:
+            n += 1
+    return n
 
 
 def matches(flt: dict, metadata: dict) -> bool:

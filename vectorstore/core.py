@@ -316,10 +316,16 @@ class _IndexState:
     reverse lookup, derived from `docs`.
     """
 
-    __slots__ = ("by_id", "dim", "docs", "faiss")
+    __slots__ = ("by_id", "dim", "docs", "faiss", "metric", "raw")
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, metric: str = "cosine", raw: bool = False):
+        # FAISS always measures squared L2. For "cosine" the vectors it holds
+        # are unit length (text embeddings already are; raw vectors are
+        # normalised on the way in), so cosine distance is d/2. With `raw`,
+        # each doc also keeps the vector it was given, returned as-is.
         self.dim = dim
+        self.metric = metric
+        self.raw = raw
         self.faiss = faiss.IndexIDMap2(faiss.IndexFlatL2(dim))
         self.docs: dict[int, dict] = {}
         self.by_id: dict[str, int] = {}
@@ -337,12 +343,19 @@ class _IndexState:
                 del self.by_id[self.docs.pop(k)["doc_id"]]
         upserts = [rec for rec in latest.values() if rec[2] is not None]
         if upserts:
+            vectors = _gather([rec[4] for rec in upserts], self.dim)
+            searchable = vectors
+            if self.raw and self.metric == "cosine":
+                searchable = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
             self.faiss.add_with_ids(
-                _gather([rec[4] for rec in upserts], self.dim),
+                np.ascontiguousarray(searchable, dtype=np.float32),
                 np.array([keys[rec[1]] for rec in upserts], dtype="int64"),
             )
-            for _, doc_id, text, metadata, _ in upserts:
-                self.docs[keys[doc_id]] = {"doc_id": doc_id, "text": text, "metadata": metadata}
+            for i, (_, doc_id, text, metadata, _) in enumerate(upserts):
+                doc = {"doc_id": doc_id, "text": text, "metadata": metadata}
+                if self.raw:
+                    doc["vector"] = vectors[i].copy()
+                self.docs[keys[doc_id]] = doc
                 self.by_id[doc_id] = keys[doc_id]
 
 
@@ -359,8 +372,26 @@ class _Cached:
         self.etag, self.manifest, self.state, self.applied = etag, manifest, state, applied
 
 
-def _new_manifest(dim: int, incarnation: str) -> dict:
-    return {"format": FORMAT, "incarnation": incarnation, "dim": dim, "next_seq": 1, "segments": [], "writers": {}}
+def _new_manifest(dim: int, incarnation: str, metric: str = "cosine", raw: bool = False, config=None) -> dict:
+    # "metric": "cosine" or "euclidean". "raw": the index holds caller-given
+    # vectors (S3 Vectors API) rather than unit-length text embeddings.
+    # "config": free-form settings of the API that created the index.
+    return {
+        "format": FORMAT,
+        "incarnation": incarnation,
+        "dim": dim,
+        "metric": metric,
+        "raw": raw,
+        "created": time.time(),
+        "config": config or {},
+        "next_seq": 1,
+        "segments": [],
+        "writers": {},
+    }
+
+
+def _state_for(manifest: dict) -> "_IndexState":
+    return _IndexState(manifest["dim"], manifest.get("metric", "cosine"), manifest.get("raw", False))
 
 
 def _encode_manifest(manifest: dict) -> bytes:
@@ -422,9 +453,24 @@ class VectorStore:
         bucket: str = BUCKET,
         io_workers: int = DEFAULT_IO_WORKERS,
         compaction: str = "background",
+        prefix: str = "",
+        default_index: str | None = DEFAULT_INDEX,
+        index_name_re: re.Pattern = _INDEX_NAME_RE,
+        raw_vectors: bool = False,
     ):
+        """`prefix`, `default_index`, `index_name_re` and `raw_vectors` let one
+        bucket hold several independent namespaces of indexes (the S3
+        Vectors API uses one per vector bucket): keys go under `prefix`;
+        `default_index` (None: none) always exists; names must match
+        `index_name_re`; and with `raw_vectors` an index stores the vectors
+        it is given (not embeddings of text) and returns them exactly.
+        """
         if compaction not in ("background", "inline", "off"):
             raise ValueError("compaction must be 'background', 'inline' or 'off'")
+        self._prefix = prefix
+        self._default = default_index
+        self._name_re = index_name_re
+        self._raw = raw_vectors
         self._client = client
         self._embedder = embedder
         self._bucket = bucket
@@ -445,6 +491,21 @@ class VectorStore:
         self._verify_conditional_writes()
 
     # -- object store helpers -------------------------------------------
+
+    def _mkey(self, name: str) -> str:
+        return self._prefix + manifest_key(name)
+
+    def _v3key(self, name: str) -> str:
+        return self._prefix + legacy_v3_key(name)
+
+    def _segdir(self, name: str, incarnation: str | None = None) -> str:
+        return self._prefix + _segment_dir(name, incarnation)
+
+    def _check_name(self, name: str) -> None:
+        if self._name_re is _INDEX_NAME_RE:
+            validate_index_name(name)
+        elif not isinstance(name, str) or not self._name_re.match(name):
+            raise ValueError(f"invalid index name {name!r}")
 
     def _ensure_bucket(self):
         if self._client.bucket_exists(self._bucket):
@@ -562,10 +623,10 @@ class VectorStore:
 
     def _read_manifest(self, name: str) -> tuple[dict, str] | None:
         try:
-            blob, etag = self._get_with_etag(manifest_key(name))
+            blob, etag = self._get_with_etag(self._mkey(name))
         except ObjectNotFoundError:
             return None
-        return _decode_manifest(blob, manifest_key(name)), etag
+        return _decode_manifest(blob, self._mkey(name)), etag
 
     def _fetch(self, manifest: dict, entries: list[dict]) -> list[tuple]:
         """All records of `entries`, read in parallel. Raises _SegmentMissing."""
@@ -595,7 +656,7 @@ class VectorStore:
         incarnation or after a full merge the cache can't follow). `stale`
         skips the HEAD when the caller knows the manifest changed.
         """
-        key = manifest_key(name)
+        key = self._mkey(name)
         missing_before = None
         while True:
             cached = self._cache.get(name)
@@ -644,7 +705,7 @@ class VectorStore:
         else:
             with _gc_paused():
                 latest = {d: r for d, r in _latest(self._fetch(manifest, entries)).items() if r[2] is not None}
-                state = _IndexState(manifest["dim"])
+                state = _state_for(manifest)
                 state.apply(latest)
             return _Cached(etag, manifest, state, applied)
         state.apply(latest)
@@ -673,23 +734,23 @@ class VectorStore:
                 continue  # someone else created it first: use theirs
         raise IndexWriteConflictError("index kept changing while being created; retry the operation")
 
-    def _create(self, name: str, dim: int, records: list[tuple]):
+    def _create(self, name: str, dim: int, records: list[tuple], metric: str = "cosine", config=None):
         """Create the manifest, with `records` (seq None) as its first segment.
 
         Raises _WriteConflict if the index already exists.
         """
-        manifest = _new_manifest(dim, uuid.uuid4().hex[:16])
+        manifest = _new_manifest(dim, uuid.uuid4().hex[:16], metric, self._raw, config)
         seg_key = None
         if records:
             blob = _encode_segment(dim, records)
-            seg_key = f"{_segment_dir(name, manifest['incarnation'])}{uuid.uuid4().hex}.seg"
+            seg_key = f"{self._segdir(name, manifest['incarnation'])}{uuid.uuid4().hex}.seg"
             self._put_conditional(seg_key, blob, if_match=None)
             manifest["segments"].append(
                 {"key": seg_key, "first_seq": 1, "last_seq": 1, "bytes": len(blob), "full": True}
             )
             manifest["next_seq"] = 2
         try:
-            self._put_conditional(manifest_key(name), _encode_manifest(manifest), if_match=None)
+            self._put_conditional(self._mkey(name), _encode_manifest(manifest), if_match=None)
         except _WriteConflict:
             if seg_key:  # never referenced: the manifest already existed
                 self._delete_quietly([seg_key])
@@ -697,11 +758,11 @@ class VectorStore:
 
     def _initial_records(self, name: str) -> tuple[int, list[tuple]] | None:
         """(dim, records) to create index `name` from; None if it doesn't exist."""
-        blob = self._get_if_exists(legacy_v3_key(name))
+        blob = self._get_if_exists(self._v3key(name))
         if blob is not None:
-            return _decode_v3(blob, legacy_v3_key(name))
-        if name != DEFAULT_INDEX:
-            return None
+            return _decode_v3(blob, self._v3key(name))
+        if name != self._default or self._prefix:
+            return None  # legacy layouts only ever held the root default index
         legacy = self._legacy_docs()
         if not legacy:
             return self._embedding_dim(), []
@@ -762,7 +823,7 @@ class VectorStore:
         """
         self._write_counter += 1
         counter = self._write_counter
-        mkey = manifest_key(name)
+        mkey = self._mkey(name)
         seg_key, seg_blob, uploaded_at = None, None, 0.0
         unresolved = False  # an append whose outcome we haven't seen yet
         conflicted = False
@@ -785,7 +846,7 @@ class VectorStore:
                     return False
                 if time.monotonic() - started > INDEX_WRITE_TIMEOUT_S:
                     break
-                seg_dir = _segment_dir(name, manifest["incarnation"])
+                seg_dir = self._segdir(name, manifest["incarnation"])
                 stale = seg_key is not None and (
                     not seg_key.startswith(seg_dir) or time.monotonic() - uploaded_at > SEGMENT_MAX_PENDING_S
                 )
@@ -907,7 +968,7 @@ class VectorStore:
         first_seq, last_seq = min(e["first_seq"] for e in merged), max(e["last_seq"] for e in merged)
         parts = _split_parts(sorted(latest.values()), manifest["dim"])
         incarnation = manifest["incarnation"]
-        seg_dir = _segment_dir(name, incarnation)
+        seg_dir = self._segdir(name, incarnation)
         new_entries, started = [], time.monotonic()
         for blob in parts:
             key = f"{seg_dir}{uuid.uuid4().hex}.seg"
@@ -929,7 +990,7 @@ class VectorStore:
                 new = {**manifest, "segments": [*entries[:pos], *new_entries, *entries[pos + len(old_keys):]]}
                 unresolved = True
                 try:
-                    self._put_conditional(manifest_key(name), _encode_manifest(new), if_match=etag)
+                    self._put_conditional(self._mkey(name), _encode_manifest(new), if_match=etag)
                 except _WriteConflict:
                     got = self._read_manifest(name)
                     if got is None:
@@ -959,7 +1020,7 @@ class VectorStore:
         cutoff = datetime.now(UTC).timestamp() - ORPHAN_GRACE_S
         orphans = [
             obj.object_name
-            for obj in self._client.list_objects(self._bucket, prefix=_segment_dir(name), recursive=True)
+            for obj in self._client.list_objects(self._bucket, prefix=self._segdir(name), recursive=True)
             if obj.object_name not in referenced
             and obj.last_modified is not None
             and obj.last_modified.timestamp() < cutoff
@@ -969,22 +1030,47 @@ class VectorStore:
     # -- indexes --------------------------------------------------------------
 
     def list_indexes(self) -> list[str]:
-        names = {DEFAULT_INDEX}
-        for obj in self._client.list_objects(self._bucket, prefix=INDEX_PREFIX):
+        names = {self._default} if self._default else set()
+        prefix = self._prefix + INDEX_PREFIX
+        for obj in self._client.list_objects(self._bucket, prefix=prefix):
             for suffix in (MANIFEST_SUFFIX, LEGACY_V3_SUFFIX):
                 if obj.object_name.endswith(suffix):
-                    names.add(obj.object_name[len(INDEX_PREFIX): -len(suffix)])
+                    names.add(obj.object_name[len(prefix): -len(suffix)])
         return sorted(names)
 
-    def create_index(self, name: str) -> None:
-        validate_index_name(name)
-        if name == DEFAULT_INDEX or self._etag(legacy_v3_key(name)) is not None:
+    def create_index(self, name: str, dim: int | None = None, metric: str = "cosine", config=None) -> None:
+        """Create an empty index. `dim` defaults to the embedder's.
+
+        `metric` ("cosine" or "euclidean") and `config` (any JSON, returned by
+        `index_info`) matter to raw-vector indexes; text indexes are cosine.
+        """
+        self._check_name(name)
+        if metric not in ("cosine", "euclidean"):
+            raise ValueError("metric must be 'cosine' or 'euclidean'")
+        if name == self._default or self._etag(self._v3key(name)) is not None:
             raise IndexAlreadyExistsError(name)
         with self._lock:
             try:
-                self._create(name, self._embedding_dim(), [])
+                self._create(name, dim or self._embedding_dim(), [], metric, config)
             except _WriteConflict:
                 raise IndexAlreadyExistsError(name) from None
+
+    def index_info(self, name: str) -> dict:
+        """{"dim", "metric", "created" (unix time), "config"}; IndexNotFoundError if absent."""
+        self._check_name(name)
+        if name == self._default:
+            with self._lock:
+                self._ensure(name)  # create it on first use, like every other read
+        got = self._read_manifest(name)  # just the manifest: no need to load the index
+        if got is None:
+            raise IndexNotFoundError(name)
+        m = got[0]
+        return {
+            "dim": m["dim"],
+            "metric": m.get("metric", "cosine"),
+            "created": m.get("created", 0.0),
+            "config": m.get("config", {}),
+        }
 
     def delete_index(self, name: str) -> None:
         """Delete a named index and its segments.
@@ -992,23 +1078,23 @@ class VectorStore:
         The legacy v3 object goes first, so a concurrent reader can't
         migrate the index back from it once the manifest is gone.
         """
-        validate_index_name(name)
-        if name == DEFAULT_INDEX:
+        self._check_name(name)
+        if name == self._default:
             raise ValueError("the default index can't be deleted")
         with self._lock:
-            had_v3 = self._etag(legacy_v3_key(name)) is not None
+            had_v3 = self._etag(self._v3key(name)) is not None
             if had_v3:
-                self._delete_object(legacy_v3_key(name))
+                self._delete_object(self._v3key(name))
             got = self._read_manifest(name)
             if got is None and not had_v3:
                 raise IndexNotFoundError(name)
             self._cache.pop(name, None)
             if got is None:
                 return
-            self._delete_object(manifest_key(name))
+            self._delete_object(self._mkey(name))
             # Only this incarnation's segments: a newer index of the same
             # name, created since, has its own prefix.
-            prefix = _segment_dir(name, got[0]["incarnation"])
+            prefix = self._segdir(name, got[0]["incarnation"])
             self._delete_quietly(
                 [o.object_name for o in self._client.list_objects(self._bucket, prefix=prefix, recursive=True)]
             )
@@ -1016,7 +1102,7 @@ class VectorStore:
     def compact(self, index: str = DEFAULT_INDEX) -> dict:
         """Merge all of an index's segments, dropping overwritten and deleted
         records, and delete orphaned segments. Returns `index_stats` after."""
-        validate_index_name(index)
+        self._check_name(index)
         with self._lock:
             self._ensure(index)
         self._compact(index, full=True)
@@ -1024,7 +1110,7 @@ class VectorStore:
 
     def index_stats(self, index: str = DEFAULT_INDEX) -> dict:
         """{"documents", "segments", "bytes"} (bytes: all segments, live or not)."""
-        validate_index_name(index)
+        self._check_name(index)
         with self._lock:
             cached = self._ensure(index)
             entries = cached.manifest["segments"]
@@ -1033,6 +1119,128 @@ class VectorStore:
                 "segments": len(entries),
                 "bytes": sum(e["bytes"] for e in entries),
             }
+
+    # -- raw vectors (the S3 Vectors API) -------------------------------------
+    # Keys are opaque strings (validated by the caller); metadata is stored
+    # as given (the caller validates it against its own limits).
+
+    def put_vectors(self, index: str, items) -> int:
+        """Add or overwrite [(key, vector, metadata)] as one write; the last
+        occurrence of a repeated key wins. Raises ValueError for a vector of
+        the wrong dimension, with NaN/infinity, or all zero on a cosine index."""
+        self._check_name(index)
+        batch: dict[str, tuple[np.ndarray, dict]] = {}
+        for key, vector, metadata in items:
+            if not isinstance(key, str) or not key:
+                raise ValueError("vector keys must be non-empty strings")
+            batch[key] = (np.asarray(vector, dtype=np.float32).reshape(-1), metadata or {})
+        if not batch:
+            return 0
+        keys = list(batch)
+        dims = {v.shape[0] for v, _ in batch.values()}
+        vecs = np.vstack([batch[k][0] for k in keys]) if len(dims) == 1 else None
+        if vecs is not None and not np.isfinite(vecs).all():
+            raise ValueError("vector data must be finite (no NaN or infinity)")
+        records = [(None, k, "", batch[k][1], (vecs, i)) for i, k in enumerate(keys)] if vecs is not None else []
+        ids = [object_key_id(k) for k in keys]
+
+        def check(state: _IndexState) -> bool:
+            if vecs is None or vecs.shape[1] != state.dim:
+                raise ValueError(f"vectors must have the index's dimension, {state.dim}; got {sorted(dims)}")
+            if state.metric == "cosine" and not np.linalg.norm(vecs, axis=1).all():
+                raise ValueError("an all-zero vector has no direction; it can't be stored in a cosine index")
+            for key, kid in zip(keys, ids):
+                owner = state.docs.get(kid)
+                if owner is not None and owner["doc_id"] != key:
+                    raise ValueError(f"key {key!r} collides with {owner['doc_id']!r}; use another key")
+            return True
+
+        with self._lock:
+            self._commit(index, records, check)
+        self._after_write(index)
+        return len(keys)
+
+    def get_vectors(self, index: str, keys) -> list[dict]:
+        """[{"key", "vector", "metadata"}] for the keys that exist, in request order."""
+        self._check_name(index)
+        with self._lock:
+            state = self._ensure(index).state
+            out = []
+            for key in keys:
+                kid = state.by_id.get(key)
+                if kid is not None:
+                    doc = state.docs[kid]
+                    out.append({"key": key, "vector": doc.get("vector"), "metadata": _copy_metadata(doc["metadata"])})
+            return out
+
+    def list_vectors(self, index: str, after: str | None, limit: int, segment: tuple[int, int] = (1, 0)):
+        """Up to `limit` vectors with keys > `after`, in key order, restricted to
+        those where hash(key) % segment[0] == segment[1] (for parallel
+        listing). Returns (vectors, last_key_or_None_if_done)."""
+        self._check_name(index)
+        count, part = segment
+        with self._lock:
+            state = self._ensure(index).state
+            keys = sorted(k for k in state.by_id if (after is None or k > after) and (count == 1 or state.by_id[k] % count == part))
+            page = keys[:limit]
+            out = [
+                {"key": k, "vector": doc.get("vector"), "metadata": _copy_metadata(doc["metadata"])}
+                for k in page
+                for doc in (state.docs[state.by_id[k]],)
+            ]
+        return out, (page[-1] if len(keys) > limit else None)
+
+    def delete_vectors(self, index: str, keys) -> None:
+        """Delete these keys; ones that don't exist are ignored."""
+        self._check_name(index)
+        keys = list(dict.fromkeys(keys))
+        if not keys:
+            return
+        with self._lock:
+            self._commit(index, [(None, k, None, None, None) for k in keys], lambda state: any(k in state.by_id for k in keys))
+        self._after_write(index)
+
+    def query_vectors(self, index: str, vector, top_k: int, filter: dict | None = None) -> tuple[str, list[dict]]:
+        """(metric, [{"key", "distance", "metadata"}]) for the top_k closest
+        vectors (exact search), closest first. Distance is 1 - cosine
+        similarity for "cosine", plain Euclidean distance for "euclidean"."""
+        self._check_name(index)
+        q = np.asarray(vector, dtype=np.float32).reshape(1, -1)
+        if not np.isfinite(q).all():
+            raise ValueError("query vector must be finite (no NaN or infinity)")
+        if filter:
+            validate_filter(filter)
+        with self._lock:
+            state = self._ensure(index).state
+            if q.shape[1] != state.dim:
+                raise ValueError(f"query vector must have the index's dimension, {state.dim}; got {q.shape[1]}")
+            if state.metric == "cosine":
+                norm = float(np.linalg.norm(q))
+                if norm == 0:
+                    raise ValueError("an all-zero query vector has no direction for cosine distance")
+                q = q / norm
+            hits = self._search(state, q, top_k, filter)
+            out = []
+            for d, doc in hits:
+                dist = d / 2.0 if state.metric == "cosine" else float(np.sqrt(max(d, 0.0)))
+                out.append({"key": doc["doc_id"], "distance": dist, "metadata": _copy_metadata(doc["metadata"])})
+            return state.metric, out
+
+    @staticmethod
+    def _search(state: "_IndexState", q: np.ndarray, top_k: int, filter: dict | None) -> list[tuple[float, dict]]:
+        """[(squared L2 distance, doc)] of the top_k matches, closest first. Holds no lock itself."""
+        if filter:
+            allowed = np.array([k for k, d in state.docs.items() if matches(filter, d["metadata"])], dtype="int64")
+            if not allowed.size:
+                return []
+            params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
+            distances, ids = state.faiss.search(q, top_k, params=params)
+        else:
+            if state.faiss.ntotal == 0:
+                return []
+            distances, ids = state.faiss.search(q, top_k)
+        # FAISS pads short result sets with id -1: skip those.
+        return [(float(d), state.docs[int(i)]) for d, i in zip(distances[0], ids[0]) if i != -1]
 
     # -- documents ------------------------------------------------------------
 
@@ -1049,7 +1257,7 @@ class VectorStore:
         the last occurrence wins. Returns the number of distinct documents
         written.
         """
-        validate_index_name(index)
+        self._check_name(index)
         batch: dict[str, tuple[str, dict]] = {}
         for doc in docs:
             doc_id, text, metadata = (*doc, None) if len(doc) == 2 else doc
@@ -1080,7 +1288,7 @@ class VectorStore:
 
     def get_document(self, doc_id: str, index: str = DEFAULT_INDEX):
         """{"doc_id", "text", "metadata"}, or None if there's no such document."""
-        validate_index_name(index)
+        self._check_name(index)
         with self._lock:
             state = self._ensure(index).state
             key = state.by_id.get(doc_id)
@@ -1091,7 +1299,7 @@ class VectorStore:
             raise ValueError("skip must not be negative")
         if not 0 <= limit <= MAX_PAGE_SIZE:
             raise ValueError(f"limit must be between 0 and {MAX_PAGE_SIZE}")
-        validate_index_name(index)
+        self._check_name(index)
         with self._lock:
             state = self._ensure(index).state
             page = sorted(state.by_id)[skip: skip + limit]
@@ -1108,7 +1316,7 @@ class VectorStore:
         is guaranteed. (If another process deleted it concurrently, both
         report True, as idempotent deletes do.)
         """
-        validate_index_name(index)
+        self._check_name(index)
         found = False
 
         def check(state: _IndexState) -> bool:
@@ -1139,35 +1347,19 @@ class VectorStore:
         """
         if not 1 <= top_k <= MAX_TOP_K:
             raise ValueError(f"top_k must be between 1 and {MAX_TOP_K}")
-        validate_index_name(index)
+        self._check_name(index)
         if filter:
             validate_filter(filter)
         qv = np.expand_dims(self._embed(query), axis=0)
         with self._lock:
             state = self._ensure(index).state
-            if filter:
-                allowed = np.array([k for k, d in state.docs.items() if matches(filter, d["metadata"])], dtype="int64")
-                if not allowed.size:
-                    return []
-                params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
-                distances, result_ids = state.faiss.search(qv, top_k, params=params)
-            else:
-                if state.faiss.ntotal == 0:
-                    return []
-                distances, result_ids = state.faiss.search(qv, top_k)
-            # FAISS pads short result sets with id -1: skip those.
             return [
-                {
-                    "doc_id": state.docs[int(i)]["doc_id"],
-                    "score": float(1.0 - d / 2.0),
-                    "metadata": _copy_metadata(state.docs[int(i)]["metadata"]),
-                }
-                for d, i in zip(distances[0], result_ids[0])
-                if i != -1
+                {"doc_id": doc["doc_id"], "score": float(1.0 - d / 2.0), "metadata": _copy_metadata(doc["metadata"])}
+                for d, doc in self._search(state, qv, top_k, filter)
             ]
 
     def count_documents(self, index: str = DEFAULT_INDEX) -> int:
-        validate_index_name(index)
+        self._check_name(index)
         with self._lock:
             return len(self._ensure(index).state.docs)
 

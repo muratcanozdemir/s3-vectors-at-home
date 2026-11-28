@@ -100,3 +100,33 @@ def test_metadata_valid_round_trip():
 def test_rejects_invalid_metadata(md):
     with pytest.raises(ValueError):
         validate_metadata(md)
+
+
+@pytest.mark.parametrize(
+    "flt,expected",
+    [
+        ({"name": {"$startsWith": "ab"}}, True),
+        ({"name": {"$startsWith": "abc"}}, True),
+        ({"name": {"$startsWith": "b"}}, False),
+        ({"tags": {"$startsWith": "sc"}}, True),  # any list element
+        ({"n": {"$startsWith": "1"}}, False),  # numbers never match
+        ({"missing": {"$startsWith": ""}}, False),
+    ],
+)
+def test_starts_with(flt, expected):
+    validate_filter(flt)
+    assert matches(flt, {"name": "abc", "tags": ["x", "science"], "n": 12}) is expected
+
+
+def test_starts_with_takes_a_string():
+    with pytest.raises(ValueError):
+        validate_filter({"name": {"$startsWith": 1}})
+
+
+def test_filter_fields_and_constraint_count():
+    from vectorstore.filters import count_constraints, filter_fields
+
+    flt = {"a": 1, "$or": [{"b": {"$in": [1, 2, 3]}}, {"c": {"$gte": 1, "$lt": 5}}]}
+    validate_filter(flt)
+    assert filter_fields(flt) == {"a", "b", "c"}
+    assert count_constraints(flt) == 6
