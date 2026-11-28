@@ -171,8 +171,10 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${TAG#v}"      # Docker convention: 0.1.0, not v0.1.0
+          minor="${version%.*}"   # 0.1: follows patch releases
           echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker build --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.version=$TAG" -t "$image:$TAG" -t "$image:latest" .
-          docker push "$image:$TAG"
-          docker push "$image:latest"
+            --label "org.opencontainers.image.version=$version" \
+            -t "$image:$version" -t "$image:$minor" -t "$image:latest" .
+          for tag in "$version" "$minor" latest; do docker push "$image:$tag"; done
