@@ -97,3 +97,21 @@ def test_cli_approximate_index():
     result = subprocess.run(["uv", "run", "s3-vectors-cli", "indexes", "create", f"{name}-x", "--m", "8"],
                             capture_output=True, text=True, check=False)
     assert result.returncode == 1 and "need --approximate" in result.stderr
+
+
+def test_cli_backup_and_restore(tmp_path):
+    name = f"cli-{uuid.uuid4().hex[:8]}"
+    run_cli(["indexes", "create", name])
+    try:
+        run_cli(["upload", "--index", name, "--doc-id", "a", "--text", "cats and dogs", "--metadata", '{"k": 1}'])
+        out = run_cli(["backup", str(tmp_path / "bk")])
+        assert f"{name}: 1 segment(s)" in out and "Backed up" in out
+        run_cli(["indexes", "delete", name])
+        assert "would restore " + name in run_cli(["restore", str(tmp_path / "bk"), "--index", name, "--dry-run"])
+        assert run_cli(["restore", str(tmp_path / "bk"), "--index", name]).endswith("Restored 1 index(es)")
+        assert '"k": 1' in run_cli(["get", "--index", name, "--doc-id", "a"])
+        result = subprocess.run(["uv", "run", "s3-vectors-cli", "restore", str(tmp_path / "bk"), "--index", name],
+                                capture_output=True, text=True, check=False)
+        assert result.returncode == 1 and "exist already" in result.stderr
+    finally:
+        run_cli(["indexes", "delete", name])

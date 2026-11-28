@@ -118,12 +118,31 @@ The S3 Vectors limits are in [S3 Vectors API](s3-vectors.md#limits).
 
 ## Backups
 
-Everything is in the `vectors` bucket, and segments are immutable, so any bucket copy works, for example with `mc mirror`. Two things make it consistent:
+`s3-vectors-cli backup DIR` copies every index, text API and S3 Vectors alike, into a new local directory. `s3-vectors-cli restore DIR` puts them back. Neither needs the server to be stopped.
 
-- **Copy manifests last,** or pause writes while copying. A manifest copied before its newest segments would point at objects the copy doesn't have.
-- **Compact first** (optional) for a smaller, tidier copy.
+```bash
+dir=$(mktemp -d)/vectors-backup
+curl -sf -X POST localhost:8000/indexes -H 'content-type: application/json' -d '{"name": "backup-demo"}'
+curl -sf -X POST localhost:8000/indexes/backup-demo/upload -H 'content-type: application/json' \
+  -d '{"doc_id": "note", "text": "remember the milk"}'
 
-To restore, copy the objects back and start the server.
+s3-vectors-cli backup "$dir"
+curl -sf -X DELETE localhost:8000/indexes/backup-demo          # disaster strikes
+s3-vectors-cli restore "$dir" --index backup-demo
+curl -sf localhost:8000/indexes/backup-demo/document/note | jq -e '.text == "remember the milk"'
+curl -sf -X DELETE localhost:8000/indexes/backup-demo
+```
+
+- **Consistent while writes go on:** an index is copied as of one moment. The backup reads its manifest, copies the segments it lists, and saves that same manifest, so concurrent writes are either all in the copy or not in it at all. If compaction removes a segment mid-copy, the backup follows the newer manifest.
+- **The directory** holds one file per object, at its object key, plus `backup.json`, which lists every file with its size and MD5. It's written last, so a directory without it is an unfinished backup. Copy the directory anywhere: it's plain files.
+- **Restores check first:** every file is verified against `backup.json` before anything is written. Segments go up before their manifest, so a running server never sees a half-restored index.
+- **Restores never overwrite** an existing index unless you pass `--replace`. Running servers then reload the replaced index on their next request, and compaction deletes its old segments later. A fresh server creates an empty `default` index on startup, so restoring `default` into it needs `--replace`.
+- **Choosing indexes:** `--index NAME` (repeatable) restores some of them: text API indexes by name, S3 Vectors ones as `BUCKET/INDEX`. `--dry-run` checks the backup and reports what would be restored.
+- **Not included:** indexes still in a layout older than manifests, because nothing has used them since an upgrade. The backup lists any it finds; any request to such an index migrates it, and then it can be backed up. Approximate indexes' graphs aren't stored, so they're rebuilt after a restore, as after any restart.
+- **In Docker,** back up to a mounted directory, for example `docker compose run --rm --user "$(id -u):$(id -g)" -v "$PWD/backups:/backups" api s3-vectors-cli backup /backups/today`. A path inside the container disappears with it, and `--user` lets the container's process write to your directory (it runs as UID 10001 otherwise).
+- **Compact first** (optional) for a smaller copy without overwritten or deleted documents.
+
+A bucket copy, for example with `mc mirror`, also works if writes are paused, or if it copies manifests last: a manifest copied before its newest segments points at objects the copy doesn't have.
 
 ## Upgrading
 

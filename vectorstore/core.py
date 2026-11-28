@@ -1898,6 +1898,16 @@ def _cache_budget_from_env() -> int | None:
     return int(mb * 1024 * 1024)
 
 
+def client_from_env() -> Minio:
+    """A MinIO client for MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY and MINIO_SECURE."""
+    return Minio(
+        os.environ["MINIO_ENDPOINT"],
+        access_key=os.environ["MINIO_ACCESS_KEY"],
+        secret_key=os.environ["MINIO_SECRET_KEY"],
+        secure=os.environ.get("MINIO_SECURE", "false").lower() == "true",
+    )
+
+
 _store: VectorStore | None = None
 _store_init_lock = threading.Lock()
 
@@ -1914,12 +1924,7 @@ def get_store() -> VectorStore:
     if _store is None:
         with _store_init_lock:
             if _store is None:
-                client = Minio(
-                    os.environ["MINIO_ENDPOINT"],
-                    access_key=os.environ["MINIO_ACCESS_KEY"],
-                    secret_key=os.environ["MINIO_SECRET_KEY"],
-                    secure=os.environ.get("MINIO_SECURE", "false").lower() == "true",
-                )
+                client = client_from_env()
                 # FAISS's OpenMP pool and ONNX Runtime's threads otherwise
                 # contend for cores: a 0.05 ms search over 1,000 docs took
                 # ~18 ms. A single-query flat search runs on one thread anyway.

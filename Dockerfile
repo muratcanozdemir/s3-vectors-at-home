@@ -26,8 +26,11 @@ COPY api ./api
 COPY vectorstore ./vectorstore
 COPY s3_vectors_at_home ./s3_vectors_at_home
 # --no-editable installs the project into the venv, so /src isn't needed after.
+# --reinstall-package rebuilds it from the source just copied: otherwise uv
+# reuses a wheel from the cache mount built from older source of the same
+# version, and the image silently ships stale code.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-editable
+    uv sync --locked --no-dev --no-editable --reinstall-package s3-vectors-at-home
 RUN /app/.venv/bin/python -c "from vectorstore.embedding import OnnxEmbedder; OnnxEmbedder.from_hub()"
 
 FROM python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
