@@ -50,6 +50,44 @@ The original routes work on the `default` index. The same routes under `/indexes
 
 For example, `POST /indexes/papers/search` with `{"query": "graph neural networks", "filter": {"year": {"$gte": 2022}}}`. `score` is cosine similarity (−1…1, higher is closer). Invalid input gets 400, unknown index or doc 404, and a write that lost to other writers too many times 503 with `Retry-After`.
 
+## S3 Vectors API
+The server also speaks the [Amazon S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html) API, so the AWS SDKs and tools built on them work against it. You bring your own vectors (any dimension up to 4,096, cosine or euclidean); this part doesn't use the built-in embedding model.
+
+```python
+import boto3
+
+s3v = boto3.client("s3vectors", endpoint_url="http://localhost:8000", region_name="us-east-1",
+                   aws_access_key_id="any", aws_secret_access_key="any")
+s3v.create_vector_bucket(vectorBucketName="media")
+s3v.create_index(vectorBucketName="media", indexName="movies", dataType="float32", dimension=4,
+                 distanceMetric="cosine", metadataConfiguration={"nonFilterableMetadataKeys": ["plot"]})
+s3v.put_vectors(vectorBucketName="media", indexName="movies", vectors=[
+    {"key": "star-wars", "data": {"float32": [0.1, 0.9, 0.2, 0.0]}, "metadata": {"genre": "scifi", "year": 1977}},
+])
+s3v.query_vectors(vectorBucketName="media", indexName="movies", queryVector={"float32": [0.1, 0.8, 0.2, 0.1]},
+                  topK=3, filter={"genre": "scifi", "year": {"$lt": 1980}}, returnMetadata=True, returnDistance=True)
+```
+
+- **Operations:**
+  - `CreateVectorBucket`, `GetVectorBucket`, `ListVectorBuckets`, `DeleteVectorBucket`;
+  - `CreateIndex`, `GetIndex`, `ListIndexes`, `DeleteIndex`;
+  - `PutVectors`, `GetVectors`, `ListVectors` (including parallel `segmentCount`/`segmentIndex` listing), `DeleteVectors`, `QueryVectors`.
+
+  These take the request and response shapes, limits and error codes of the service model. Resources can be addressed by name or by ARN (`S3VAH_REGION` and `S3VAH_ACCOUNT_ID` set the ARNs' region and account, default `us-east-1` / `000000000000`). The SDK paginators work.
+- **Search is exact.** The top-k is the true top-k among the vectors that match the filter, always. Filters support `$eq $ne $gt $gte $lt $lte $in $nin $exists $startsWith $and $or`. Metadata limits are S3 Vectors': 50 keys; 100 KB in all; 40 KB filterable, with each filterable string up to 2 KB. `nonFilterableMetadataKeys` are stored and returned but can't be filtered on.
+- **Where AWS's docs leave it open, this server chooses:**
+  - cosine `distance` is 1 − cosine similarity, and euclidean is the plain (not squared) distance, closest first;
+  - `GetVectors` leaves out keys that don't exist, and `DeleteVectors` ignores them;
+  - a filter on a non-filterable key is a `ValidationException`;
+  - deleting a vector bucket that still has indexes is a `ConflictException`;
+  - NaN, infinity, a wrong dimension, or an all-zero vector on a cosine index are rejected.
+- **Not supported** (each answered with a clear `ValidationException`):
+  - full-text and hybrid search (`queryTexts`, `textSearchConfigurations`);
+  - KMS encryption;
+  - bucket policies, tags, and index-mode updates.
+- **No request signatures are checked:** any credentials work, as with the rest of this API. Run it on a network you trust. `S3VAH_S3VECTORS_API=false` turns the S3 Vectors routes off.
+- **Storage.** Vector buckets live under `s3vectors/` in the same MinIO bucket, on the same segmented, compare-and-swap storage as the text API, so the same concurrency guarantees apply. Vectors are stored and returned exactly as the float32 values you sent.
+
 ## Sample CLI commands
 Every document command takes `--index NAME` (default `default`), after the command name.
 
@@ -100,7 +138,7 @@ export MINIO_SECRET_KEY=minioadmin123
 uv sync --all-extras
 uv run pytest
 ```
-`tests/test_vectorstore_golden.py`, `tests/test_segments.py` and `tests/test_filters.py` are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
+`tests/test_vectorstore_golden.py`, `tests/test_segments.py`, `tests/test_filters.py` and `tests/test_s3vectors_api.py` (boto3 against an in-process server) are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
 
 # Contributing
 - Dependencies are locked (`uv.lock`, committed), so `uv sync` stays reproducible.

@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from api import s3vectors as _s3vectors
 from vectorstore.core import (
     DEFAULT_INDEX,
     MAX_PAGE_SIZE,
@@ -182,3 +183,8 @@ def delete_index(index: str):
 
 app.include_router(_default_routes)
 app.include_router(_named_routes)
+
+# The Amazon S3 Vectors API (POST /CreateIndex, /PutVectors, /QueryVectors, ...),
+# for the AWS SDKs. S3VAH_S3VECTORS_API=false turns it off.
+if _s3vectors.enabled():
+    app.include_router(_s3vectors.router)

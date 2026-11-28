@@ -24,7 +24,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "pytest-cov"]
+# boto3: tests drive the S3 Vectors API with the real AWS SDK.
+dev = ["pytest", "httpx", "pytest-cov", "boto3>=1.40"]
 
 [project.scripts]
 s3-vectors-cli = "s3_vectors_at_home.cli:main"
