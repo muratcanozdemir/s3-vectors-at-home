@@ -22,7 +22,7 @@ def test_add_and_get_document():
     text = "Document for core API testing"
     store.add_document(doc_id, text)
     doc = store.get_document(doc_id)
-    assert doc == {"doc_id": doc_id, "text": text}
+    assert doc == {"doc_id": doc_id, "text": text, "metadata": {}}
     store.delete_document(doc_id)
 
 
