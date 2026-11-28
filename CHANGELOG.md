@@ -5,10 +5,8 @@
 
 ### Features
 
-* Amazon S3 Vectors API, compatible with the AWS SDKs ([5790f79](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/5790f799a6ffe462d18c372f6a0b3849f2391027))
 * Amazon S3 Vectors API, compatible with the AWS SDKs ([bf4e583](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/bf4e5831de8d0dfab08eaaacab9bd9c2619eca90))
 * batch bulk upload, cache FAISS index in memory, bound paging/top_k ([#5](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/5)) ([3cdac5e](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/3cdac5eb24a475a606d9fb991b45dc30c26a233f))
-* container image and `docker compose up` for MinIO + API ([4369e05](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/4369e05ce30710a1e49cf63485c5bad348cb1bc8))
 * container image and docker compose up for MinIO + API (and fix the wheel) ([01d617a](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/01d617ad20357f5a3a3772a09a1ff0d0c67fed15))
 * metadata, filtered search, and named indexes ([#9](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/9)) ([c7e736b](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/c7e736b31a413a5b5ce546911a5d93d507134843))
 * register in Murat's software catalog, add LICENSE ([72bbbce](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/72bbbceda4a54c9b49b06058789e9c078995507d))

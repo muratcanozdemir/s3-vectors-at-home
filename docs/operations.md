@@ -1,0 +1,103 @@
+# Operations
+
+## Deploying
+
+- **One container per API process group.** The image runs uvicorn with `WEB_CONCURRENCY` workers. For more throughput, add workers or replicas; they all share one MinIO bucket safely (see [below](#many-processes-one-bucket)).
+- **Health:** `GET /status` answers once the model and the default index are loaded. The image's `HEALTHCHECK` uses it, and so should your orchestrator's readiness probe.
+- **Startup is fail-fast.** The server exits if MinIO is unreachable or doesn't enforce conditional writes. `compose.yaml` restarts it until MinIO is up.
+- **Image tags:** `ghcr.io/muratcanozdemir/s3-vectors-at-home:<version>` (e.g. `0.1.0`), `:<major.minor>` (e.g. `0.1`, which moves with patch releases), and `:latest`.
+- **Security:** neither API authenticates, and the S3 Vectors API doesn't check request signatures. Keep the server on a trusted network, or put an authenticating proxy in front of it.
+
+## Requirements
+
+The object store must **enforce conditional writes**: `If-Match` and `If-None-Match: *` on PUT. All concurrency safety rests on them.
+
+- **MinIO:** enforces them in releases since late 2024; `minio/docker-compose.yaml` pins one.
+- **Other stores:** the server checks at startup and refuses to run on a store that ignores them, rather than quietly risk lost updates.
+
+## Storage layout
+
+An index is a small **manifest** plus immutable **segments**:
+
+```
+vectors/                                   # the MinIO bucket
+├── indexes/<name>.manifest.json           # which segments make up the index; the only object rewritten
+├── segments/<name>/<incarnation>/<id>.seg # text, metadata and vectors (or delete markers) of one write
+└── s3vectors/
+    ├── _buckets/<vector-bucket>.json      # S3 Vectors bucket registry
+    └── <vector-bucket>/indexes/…, segments/…   # the same layout, per vector bucket
+```
+
+- **Writes** upload one segment holding just that write's documents, then append it to the manifest. A write therefore costs the same whether the index holds 50 documents or 50,000.
+- **Reads** (get, list, count, search, filtering) are served from memory.
+- **Caching:** every operation does a cheap `HEAD` on the manifest. When another process has written, only the new manifest and the segments not yet seen are downloaded.
+
+## Compaction
+
+- **Automatic:** segments are merged in the background after writes, size-tiered. An index keeps a few dozen segments at most, and each document is rewritten about log₂(n) times over its life.
+- **Manual:** `POST /indexes/{name}/compact` (or `s3-vectors-cli indexes compact NAME`) merges everything into one segment. It reclaims the space of overwritten and deleted documents, and it's useful before a backup.
+- **Orphans:** compaction also deletes segments that a crash or failed write left behind and nothing references, once they're an hour old. This assumes the clocks of the machines writing to a bucket agree to within about 45 minutes.
+
+## Many processes, one bucket
+
+Any number of API workers, replicas and CLI runs can read and write the same bucket at once.
+
+- **Compare-and-swap:** every manifest update is a conditional PUT, so a writer that loses a race reloads and appends its segment on top. No update is lost, and merges use the same mechanism.
+- **Same document from several writers:** every record gets a sequence number, and a document's newest record wins as a whole. Concurrent writes to one `doc_id` are safe.
+- **Throughput ceiling:** all writes to one index pass through its manifest, so they top out at roughly 100+ per second across all processes. With 32 processes writing flat out against local MinIO, about 120 writes/s went through, and every write succeeded, the slowest after 36 attempts.
+- **Batch for more:** `/upload/bulk` and `PutVectors` write many documents per manifest update.
+- **Write timeout:** a write that keeps losing for 30 seconds gives up without being applied. The API answers 503 with `Retry-After`, S3 Vectors answers `ServiceUnavailableException`, and the CLI exits 1.
+- **Deletes are final:** a write racing an index delete fails with "index not found" rather than re-creating the index. Re-creating the name gives a fresh, empty index.
+
+## Performance
+
+Measured on a laptop against local MinIO.
+
+**With 1,000 documents:**
+
+| Operation | Time |
+|---|---|
+| bulk upload | ~1.3 s (almost all of it the embedding model) |
+| search | ~3 ms (about 2 ms embedding the query, 1 ms checking the manifest) |
+| filtered search | ~4 ms |
+| get, list, count | under 1 ms |
+
+**A single write** stays at about 6–12 ms and uploads about 6 KB, whatever the index size. The old one-object layout cost more as the index grew:
+
+| Index size | Old layout | Now |
+|---|---|---|
+| 1,000 docs | 13 ms / 1.8 MB | ~6–12 ms / ~6 KB |
+| 10,000 docs | 71 ms / 18 MB | ~6–12 ms / ~6 KB |
+| 50,000 docs | 565 ms / 88 MB | ~6–12 ms / ~6 KB |
+
+**Loading** a 50,000-document index from scratch takes about 0.3 s. The API loads the model and the default index at startup, so the first request isn't slow.
+
+## Limits
+
+| | |
+|---|---|
+| Text API `top_k` | 1–1,000 |
+| Text API paging | `skip` ≥ 0, `limit` 0–1,000 |
+| Text API index names | 1–63 characters: `a-z`, `0-9` and `-` |
+| `doc_id` | up to 512 characters, no `/` |
+| Text API metadata | 32 keys, 4 KB |
+
+The S3 Vectors limits are in [S3 Vectors API](s3-vectors.md#limits).
+
+## Backups
+
+Everything is in the `vectors` bucket, and segments are immutable, so any bucket copy works, for example with `mc mirror`. Two things make it consistent:
+
+- **Copy manifests last,** or pause writes while copying. A manifest copied before its newest segments would point at objects the copy doesn't have.
+- **Compact first** (optional) for a smaller, tidier copy.
+
+To restore, copy the objects back and start the server.
+
+## Upgrading
+
+Each index is migrated the first time it's used:
+
+- from the previous one-object layout (`indexes/<name>.v3.bin`);
+- for the default index, also from the original layouts (`index.v2.bin`, or `faiss.index` + `index.ids.json` with per-document `<id>.npy` / `<id>.meta.json` objects), with empty metadata.
+
+The old objects are left in place, and nothing reads them again, so delete them once you're sure you won't roll back. Don't run old and new versions against the same bucket at the same time: the old code doesn't see writes made by the new.
