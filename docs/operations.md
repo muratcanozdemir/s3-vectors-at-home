@@ -32,6 +32,16 @@ vectors/                                   # the MinIO bucket
 - **Reads** (get, list, count, search, filtering) are served from memory.
 - **Caching:** every operation does a cheap `HEAD` on the manifest. When another process has written, only the new manifest and the segments not yet seen are downloaded.
 
+## Memory
+
+Every worker process keeps each index it has used in memory: vectors, text and metadata. Roughly, a document takes 4.4 bytes per dimension per vector, plus its text, plus ~200 bytes; a 384-dimension text index needs about 2.7 KB per short document, so 100,000 documents take ~270 MB, in every worker.
+
+- **The budget:** `S3VAH_CACHE_MB` caps what one process holds across all its indexes, text and S3 Vectors alike. When the total goes over, the indexes used least recently are dropped. The next request for a dropped index reloads it from MinIO (about 0.3 s for 50,000 documents), so set the budget above what your busy indexes need, and let it trim the ones used rarely.
+- **The index in use** is never dropped. An index bigger than the whole budget still works; it's just the only one kept.
+- **Without a budget** (the default), nothing is dropped, as in earlier versions.
+- **Watching it:** `GET /status` reports this worker's `cache`: how many indexes it holds, their estimated `bytes`, the `max_bytes` budget, and the `evictions` so far. Frequent evictions mean the budget is too small for the working set. The size is an estimate, within about 5% of measured memory for 384- and 1,024-dimension indexes.
+- **With several workers,** each has its own budget: total memory is up to `WEB_CONCURRENCY` × `S3VAH_CACHE_MB`, plus about 240 MB per worker for the server and the model before any index is loaded.
+
 ## Compaction
 
 - **Automatic:** segments are merged in the background after writes, size-tiered. An index keeps a few dozen segments at most, and each document is rewritten about log₂(n) times over its life.
@@ -101,3 +111,5 @@ Each index is migrated the first time it's used:
 - for the default index, also from the original layouts (`index.v2.bin`, or `faiss.index` + `index.ids.json` with per-document `<id>.npy` / `<id>.meta.json` objects), with empty metadata.
 
 The old objects are left in place, and nothing reads them again, so delete them once you're sure you won't roll back. Don't run old and new versions against the same bucket at the same time: the old code doesn't see writes made by the new.
+
+**Long documents (chunking).** Segments from earlier versions read unchanged, and documents in them keep their single vector until they are written again. Once a document longer than 256 tokens has been written, though, its index has segments that versions without chunking can't read: they report the index as unreadable. To roll back, delete or re-upload those documents with `S3VAH_CHUNK_OVERLAP=off` and compact first.

@@ -76,6 +76,7 @@ class SearchRequest(BaseModel):
     filter: dict[str, Any] | None = Field(
         None, description="Metadata filter, e.g. {\"lang\": \"en\", \"year\": {\"$gte\": 2020}}"
     )
+    passages: bool = Field(False, description="Add each match's best-matching passage and its character span")
 
 
 class IndexCreate(BaseModel):
@@ -130,7 +131,9 @@ def _document_routes(router: APIRouter, index_dep):
 
     @router.post("/search")
     def search(req: SearchRequest, index: str = from_route):
-        results = get_store().search_with_scores(req.query, req.top_k, index=index, filter=req.filter)
+        results = get_store().search_with_scores(
+            req.query, req.top_k, index=index, filter=req.filter, passages=req.passages
+        )
         # `matches` (bare doc_ids) is kept as-is for existing clients;
         # `results` adds score and metadata per match.
         return {"matches": [r["doc_id"] for r in results], "results": results}
@@ -143,9 +146,12 @@ def _document_routes(router: APIRouter, index_dep):
             "status": "ok",
             "index": index,
             "document_count": stats["documents"],
+            "vector_count": stats["vectors"],
             "segments": stats["segments"],
             "storage_bytes": stats["bytes"],
             "embedding_model": store.embedding_model_name(),
+            # This worker process's memory for loaded indexes (all of them).
+            "cache": store.cache_stats(),
         }
 
     @router.post("/compact")

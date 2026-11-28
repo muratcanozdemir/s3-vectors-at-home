@@ -68,13 +68,13 @@ note-2 - Call the dentist about Tuesday
 note-3 - Pick up bread and eggs
 Deleted note-2
 Index: cli-demo
-Documents: 2
+Documents: 2 (2 vectors)
 Segments: 3 (4,976 bytes)
 Embedding model: all-MiniLM-L6-v2
 ```
 
 - **The bulk file** is a JSON list of `{"doc_id", "text", "metadata"?}` objects. As with the API, one bad entry rejects the whole file and nothing is uploaded.
-- **`search` without `--scores`** prints `Matches: [...]`.
+- **`search` without `--scores`** prints `Matches: [...]`. With `--passages` it prints each match's score, doc_id and `[start:end]` span, then the best-matching passage, indented.
 
 ## Exit codes
 

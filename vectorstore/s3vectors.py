@@ -245,6 +245,7 @@ class S3VectorsService:
         region: str | None = None,
         account_id: str | None = None,
         compaction: str = "background",
+        cache: core.IndexCache | None = None,
     ):
         self.region = region or os.environ.get("S3VAH_REGION", "us-east-1")
         self.account_id = account_id or os.environ.get("S3VAH_ACCOUNT_ID", "000000000000")
@@ -256,6 +257,8 @@ class S3VectorsService:
         self._compactor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s3vectors-compact")
         self._stores: dict[str, core.VectorStore] = {}
         self._stores_lock = threading.Lock()
+        # One memory budget for every vector bucket's loaded indexes.
+        self._cache = cache or core.IndexCache()
         # Holds no indexes; used for the registry objects, and runs the one
         # startup check that the object store enforces conditional writes.
         self._registry = self._new_store("_registry", verify=True)
@@ -273,6 +276,7 @@ class S3VectorsService:
             io_pool=self._io,
             compactor=self._compactor,
             verify_conditional_writes=verify,
+            cache=self._cache,
         )
 
     def _store(self, vector_bucket: str) -> core.VectorStore:

@@ -7,6 +7,7 @@ validation) in isolation from MinIO and the real embedding model.
 """
 
 import hashlib
+import re
 import threading
 from collections import defaultdict, namedtuple
 from datetime import UTC, datetime
@@ -156,6 +157,25 @@ class FakeEmbedder:
     """
 
     dim = 8
+
+    def __init__(self, window: int | None = None):
+        # Words per chunk for `chunk_spans`; None: never split (one span).
+        self.window = window
+
+    def chunk_spans(self, text, overlap=0):
+        """Whitespace words stand in for tokens: windows of `window` words,
+        consecutive ones sharing `overlap` words."""
+        words = [m.span() for m in re.finditer(r"\S+", text)]
+        if self.window is None or len(words) <= self.window:
+            return [(0, len(text))]
+        step = max(1, self.window - min(overlap, self.window // 2))
+        spans = []
+        for start in range(0, len(words), step):
+            chunk = words[start: start + self.window]
+            spans.append((chunk[0][0], chunk[-1][1]))
+            if start + self.window >= len(words):
+                break
+        return spans
 
     def encode(self, texts, normalize_embeddings=True):
         vectors = []

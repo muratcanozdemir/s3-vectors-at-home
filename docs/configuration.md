@@ -20,6 +20,8 @@ Everything is set with environment variables. The same variables apply to the se
 |---|---|---|
 | `WEB_CONCURRENCY` | `1` | API worker processes (read by uvicorn). Workers share the bucket safely. |
 | `S3VAH_EMBED_THREADS` | ONNX Runtime's default (all cores) | threads per worker for embedding. Set it to about cores ÷ workers. |
+| `S3VAH_CACHE_MB` | no limit | memory for loaded indexes, per worker process, in MiB. Past it, the least recently used indexes are dropped and reloaded when next used. See [Operations](operations.md#memory). |
+| `S3VAH_CHUNK_OVERLAP` | `32` | tokens shared by consecutive chunks of a long text in the text API; `off` embeds only the first 256 tokens, as earlier versions did. See [Long documents](text-api.md#long-documents). |
 | `S3VAH_S3VECTORS_API` | `true` | `false` removes the [S3 Vectors API](s3-vectors.md) routes |
 | `S3VAH_REGION` | `us-east-1` | region shown in S3 Vectors ARNs |
 | `S3VAH_ACCOUNT_ID` | `000000000000` | account shown in S3 Vectors ARNs |
