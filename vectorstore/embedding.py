@@ -54,6 +54,9 @@ class OnnxEmbedder:
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         if threads:
             opts.intra_op_num_threads = threads
+        # Idle ORT threads would otherwise spin between calls, stealing CPU
+        # from FAISS and request handling; costs nothing measurable per call.
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
         self._session = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
         self._input_names = {i.name for i in self._session.get_inputs()}
         self._batch_size = batch_size

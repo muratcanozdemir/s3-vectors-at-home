@@ -678,5 +678,9 @@ def get_store() -> VectorStore:
                     secret_key=os.environ["MINIO_SECRET_KEY"],
                     secure=os.environ.get("MINIO_SECURE", "false").lower() == "true",
                 )
+                # FAISS's OpenMP pool and ONNX Runtime's threads otherwise
+                # contend for cores: a 0.05 ms search over 1,000 docs took
+                # ~18 ms. A single-query flat search runs on one thread anyway.
+                faiss.omp_set_num_threads(1)
                 _store = VectorStore(client, OnnxEmbedder.from_hub())
     return _store
