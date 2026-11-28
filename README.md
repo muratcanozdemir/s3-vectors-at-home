@@ -138,7 +138,7 @@ export MINIO_SECRET_KEY=minioadmin123
 uv sync --all-extras
 uv run pytest
 ```
-`tests/test_vectorstore_golden.py`, `tests/test_segments.py`, `tests/test_filters.py` and `tests/test_s3vectors_api.py` (boto3 against an in-process server) are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
+`tests/test_vectorstore_golden.py`, `tests/test_segments.py`, `tests/test_filters.py`, `tests/test_edge_cases.py`, `tests/test_properties.py` (randomised checks against a dict + numpy model) and `tests/test_s3vectors_api.py` (boto3 against an in-process server) are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
 
 # Contributing
 - Dependencies are locked (`uv.lock`, committed), so `uv sync` stays reproducible.

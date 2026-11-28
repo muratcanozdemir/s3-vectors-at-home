@@ -11,6 +11,7 @@ from vectorstore.core import (
     MAX_PAGE_SIZE,
     MAX_TOP_K,
     IndexAlreadyExistsError,
+    IndexCorruptError,
     IndexNotFoundError,
     IndexWriteConflictError,
     get_store,
@@ -34,6 +35,12 @@ def index_write_conflict(_request: Request, exc: IndexWriteConflictError):
     # Contention, not a bad request: nothing was half-applied and the same
     # request can simply be sent again.
     return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "1"})
+
+
+@app.exception_handler(IndexCorruptError)
+def index_corrupt(_request: Request, exc: IndexCorruptError):
+    # The stored data is broken: a server error, never the client's 400.
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 
 @app.exception_handler(IndexNotFoundError)

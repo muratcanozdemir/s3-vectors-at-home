@@ -17,6 +17,7 @@ from vectorstore.core import (
     DEFAULT_INDEX,
     MAX_PAGE_SIZE,
     MAX_TOP_K,
+    IndexCorruptError,
     VectorStore,
     manifest_key,
 )
@@ -252,7 +253,7 @@ def test_unrecognised_index_blob_is_an_error(store):
     store.add_document("a", "alpha")
     store._client.objects[store._bucket][INDEX_OBJ] = b"garbage"
     fresh = VectorStore(store._client, FakeEmbedder())
-    with pytest.raises(ValueError):
+    with pytest.raises(IndexCorruptError):
         fresh.search("alpha", top_k=1)
 
 

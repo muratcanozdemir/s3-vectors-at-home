@@ -35,13 +35,16 @@ import numpy as np
 from vectorstore import core
 from vectorstore.filters import (
     _is_scalar,
+    _require_unicode,
     count_constraints,
     filter_fields,
     validate_filter,
 )
 
 ROOT = "s3vectors/"
-REGISTRY_PREFIX = ROOT + "buckets/"
+# "_" can't occur in a bucket name, so no bucket's namespace (ROOT + name)
+# can overlap the registry.
+REGISTRY_PREFIX = ROOT + "_buckets/"
 # Bucket and index names: 3-63 of lowercase letters, digits, '-' and '.',
 # starting and ending with a letter or digit (the ARN pattern in the model).
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
@@ -180,6 +183,10 @@ def validate_metadata(metadata, non_filterable: set[str]) -> dict:
             raise _invalid(f"metadata keys must be 1 to {MAX_METADATA_KEY_LENGTH} characters")
         if key.startswith("$"):
             raise _invalid(f"metadata key {key!r} must not start with '$'")
+        try:
+            _require_unicode(key, value)
+        except ValueError as e:
+            raise _invalid(str(e)) from None
         if isinstance(value, list):
             if not all(_is_scalar(v) for v in value):
                 raise _invalid(f"metadata list {key!r} may only contain strings, finite numbers and booleans")
@@ -244,14 +251,16 @@ class S3VectorsService:
         self._client = client
         self._bucket = bucket
         self._compaction = compaction
-        # Holds no indexes; used for the registry objects (and its startup
-        # check that the object store enforces conditional writes).
-        self._registry = self._new_store("_registry")
+        # One set of threads for every vector bucket's store, however many.
+        self._io = ThreadPoolExecutor(max_workers=core.DEFAULT_IO_WORKERS, thread_name_prefix="s3vectors-io")
+        self._compactor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s3vectors-compact")
         self._stores: dict[str, core.VectorStore] = {}
         self._stores_lock = threading.Lock()
-        self._io = ThreadPoolExecutor(max_workers=core.DEFAULT_IO_WORKERS, thread_name_prefix="s3vectors-io")
+        # Holds no indexes; used for the registry objects, and runs the one
+        # startup check that the object store enforces conditional writes.
+        self._registry = self._new_store("_registry", verify=True)
 
-    def _new_store(self, vector_bucket: str) -> core.VectorStore:
+    def _new_store(self, vector_bucket: str, verify: bool = False) -> core.VectorStore:
         return core.VectorStore(
             self._client,
             None,
@@ -261,6 +270,9 @@ class S3VectorsService:
             default_index=None,
             index_name_re=NAME_RE,
             raw_vectors=True,
+            io_pool=self._io,
+            compactor=self._compactor,
+            verify_conditional_writes=verify,
         )
 
     def _store(self, vector_bucket: str) -> core.VectorStore:
@@ -546,8 +558,9 @@ class S3VectorsService:
     def get_vectors(self, req: dict) -> dict:
         bucket, index, store = self._index_store(req)
         keys = self._keys(req, MAX_GET_VECTORS)
+        return_data, return_meta = _bool(req, "returnData"), _bool(req, "returnMetadata")  # checked even if nothing matches
         found = self._call(store.get_vectors, bucket, index, index, keys)
-        return {"vectors": [self._out(v, _bool(req, "returnData"), _bool(req, "returnMetadata")) for v in found]}
+        return {"vectors": [self._out(v, return_data, return_meta) for v in found]}
 
     def list_vectors(self, req: dict) -> dict:
         bucket, index, store = self._index_store(req)
@@ -582,6 +595,8 @@ class S3VectorsService:
         if req.get("queryVector") is None:
             raise _invalid("queryVector is required")
         query = _vector(req["queryVector"], "queryVector")
+        return_meta, return_distance = _bool(req, "returnMetadata"), _bool(req, "returnDistance")
+        _bool(req, "returnScores")
         top_k = _int(req, "topK", 1, MAX_TOP_K)
         if top_k is None:
             raise _invalid("topK is required")
@@ -603,7 +618,6 @@ class S3VectorsService:
             offset = token["offset"]
         metric, hits = self._call(store.query_vectors, bucket, index, index, query, top_k, flt)
         page = hits[offset: offset + QUERY_PAGE_SIZE]
-        return_meta, return_distance = _bool(req, "returnMetadata"), _bool(req, "returnDistance")
         vectors = []
         for h in page:
             v = {"key": h["key"]}
@@ -646,5 +660,7 @@ class S3VectorsService:
             raise _not_found(f"index {index!r} not found in {bucket!r}") from None
         except core.IndexWriteConflictError as e:
             raise S3VectorsError("ServiceUnavailableException", str(e), 503) from None
+        except core.IndexCorruptError as e:
+            raise S3VectorsError("InternalServerException", str(e), 500) from None
         except ValueError as e:
             raise _invalid(str(e)) from None

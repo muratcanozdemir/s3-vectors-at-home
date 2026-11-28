@@ -2,9 +2,12 @@ import argparse
 import json
 import sys
 
+from minio.error import S3Error
+
 from vectorstore.core import (
     DEFAULT_INDEX,
     IndexAlreadyExistsError,
+    IndexCorruptError,
     IndexNotFoundError,
     IndexWriteConflictError,
     get_store,
@@ -156,12 +159,18 @@ def main():
     args = ap.parse_args()
     try:
         args.func(args)
-    except (ValueError, IndexNotFoundError, IndexAlreadyExistsError, IndexWriteConflictError) as e:
+    except (ValueError, IndexNotFoundError, IndexAlreadyExistsError, IndexWriteConflictError, IndexCorruptError) as e:
         msg = {
             IndexNotFoundError: f"index {e.args[0]!r} not found",
             IndexAlreadyExistsError: f"index {e.args[0]!r} already exists",
         }.get(type(e), str(e))
         print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:  # a missing file, or the object store unreachable
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except S3Error as e:
+        print(f"Error: object store refused the request: {e.code}: {e.message}", file=sys.stderr)
         sys.exit(1)
 
 

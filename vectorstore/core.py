@@ -158,7 +158,9 @@ class IndexWriteConflictError(RuntimeError):
 
 
 class IndexCorruptError(RuntimeError):
-    """The manifest references a segment that doesn't exist."""
+    """Stored index data is missing or unreadable (a referenced segment is
+    gone, or an object doesn't parse). Not the caller's fault: the API
+    reports it as a server error."""
 
 
 class _WriteConflict(Exception):
@@ -181,9 +183,33 @@ def object_key_id(doc_id: str) -> int:
     return int.from_bytes(digest, "big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 
+def require_unicode(value: str, what: str) -> None:
+    """Reject strings that aren't valid Unicode (lone surrogates such as
+    "\\ud800", which JSON can carry): they can't be encoded as UTF-8, so the
+    tokenizer or the hash of a key would fail on them later, as a 500."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{what} must be valid Unicode (it contains a lone surrogate)") from None
+
+
+def unit_rows(vectors: np.ndarray) -> np.ndarray:
+    """Rows scaled to unit length, as float32. Norms are taken in float64:
+    in float32, squaring 1e20 overflows to infinity and squaring 1e-20
+    underflows to zero, which would wreck (or falsely reject as all-zero)
+    perfectly good vectors."""
+    v64 = np.asarray(vectors, dtype=np.float64)
+    return (v64 / np.linalg.norm(v64, axis=-1, keepdims=True)).astype(np.float32)
+
+
+def row_norms(vectors: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(np.asarray(vectors, dtype=np.float64), axis=-1)
+
+
 def validate_doc_id(doc_id: str) -> None:
     if not isinstance(doc_id, str) or not doc_id:
         raise ValueError("doc_id must be a non-empty string")
+    require_unicode(doc_id, "doc_id")
     # Not an object key any more, but it is a URL path segment in the API.
     if "/" in doc_id:
         raise ValueError("doc_id must not contain '/'")
@@ -233,6 +259,30 @@ def _encode_segment(dim: int, records: list[tuple]) -> bytes:
     return b"".join((SEGMENT_MAGIC, struct.pack(">Q", len(header)), header, body))
 
 
+def _corrupt_on_error(what: str):
+    """Decorate a decoder of stored data: any failure to parse it (bad magic,
+    truncation, bad JSON, wrong sizes) becomes IndexCorruptError naming the
+    object. It is the store's data that is broken, not the caller's
+    request, so it must not surface as a ValueError (which the API reports
+    as 400 Bad Request)."""
+
+    def wrap(fn):
+        def decode(blob, key, *args):
+            try:
+                return fn(blob, key, *args)
+            except IndexCorruptError:
+                raise
+            except (ValueError, TypeError, KeyError, IndexError, struct.error) as e:
+                raise IndexCorruptError(f"{what} {key!r} is unreadable: {e}") from e
+
+        decode.__name__ = fn.__name__
+        decode.__doc__ = fn.__doc__
+        return decode
+
+    return wrap
+
+
+@_corrupt_on_error("segment")
 def _decode_segment(blob: bytes, key: str, dim: int, default_seq: int) -> list[tuple]:
     if not blob.startswith(SEGMENT_MAGIC):
         raise ValueError(f"{key} is not a recognised segment")
@@ -346,7 +396,7 @@ class _IndexState:
             vectors = _gather([rec[4] for rec in upserts], self.dim)
             searchable = vectors
             if self.raw and self.metric == "cosine":
-                searchable = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+                searchable = unit_rows(vectors)
             self.faiss.add_with_ids(
                 np.ascontiguousarray(searchable, dtype=np.float32),
                 np.array([keys[rec[1]] for rec in upserts], dtype="int64"),
@@ -398,6 +448,7 @@ def _encode_manifest(manifest: dict) -> bytes:
     return json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
 
 
+@_corrupt_on_error("manifest")
 def _decode_manifest(blob: bytes, key: str) -> dict:
     try:
         manifest = json.loads(blob)
@@ -457,6 +508,9 @@ class VectorStore:
         default_index: str | None = DEFAULT_INDEX,
         index_name_re: re.Pattern = _INDEX_NAME_RE,
         raw_vectors: bool = False,
+        io_pool: ThreadPoolExecutor | None = None,
+        compactor: ThreadPoolExecutor | None = None,
+        verify_conditional_writes: bool = True,
     ):
         """`prefix`, `default_index`, `index_name_re` and `raw_vectors` let one
         bucket hold several independent namespaces of indexes (the S3
@@ -464,6 +518,11 @@ class VectorStore:
         `default_index` (None: none) always exists; names must match
         `index_name_re`; and with `raw_vectors` an index stores the vectors
         it is given (not embeddings of text) and returns them exactly.
+
+        `io_pool` and `compactor` share thread pools between stores (many
+        namespaces must not mean many threads each), and
+        `verify_conditional_writes=False` skips the startup probe for a store
+        whose client another store has already checked.
         """
         if compaction not in ("background", "inline", "off"):
             raise ValueError("compaction must be 'background', 'inline' or 'off'")
@@ -475,20 +534,21 @@ class VectorStore:
         self._embedder = embedder
         self._bucket = bucket
         self._lock = threading.Lock()
-        self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
+        self._io = io_pool or ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
         self._cache: dict[str, _Cached] = {}
         self._dim: int | None = None
         # Identifies this store's writes in manifests; see `_commit`.
         self._writer_id = uuid.uuid4().hex[:16]
         self._write_counter = 0
         self._compaction = compaction
-        self._compactor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vectorstore-compact")
+        self._compactor = compactor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="vectorstore-compact")
         self._compact_lock = threading.Lock()
         self._compact_idle = threading.Condition(self._compact_lock)
         self._compacting: set[str] = set()
         self._compact_again: set[str] = set()
-        self._ensure_bucket()
-        self._verify_conditional_writes()
+        if verify_conditional_writes:
+            self._ensure_bucket()
+            self._verify_conditional_writes()
 
     # -- object store helpers -------------------------------------------
 
@@ -781,7 +841,7 @@ class VectorStore:
         if LEGACY_V2_INDEX_OBJ in names:
             blob = self._get_bytes(LEGACY_V2_INDEX_OBJ)
             if not blob.startswith(LEGACY_V2_MAGIC):
-                raise ValueError(f"{LEGACY_V2_INDEX_OBJ} is not a recognised v2 index blob")
+                raise IndexCorruptError(f"{LEGACY_V2_INDEX_OBJ} is not a recognised v2 index blob")
             (ids_len,) = struct.unpack_from(">Q", blob, len(LEGACY_V2_MAGIC))
             start = len(LEGACY_V2_MAGIC) + 8
             live = list(json.loads(blob[start: start + ids_len]).values())
@@ -1133,6 +1193,7 @@ class VectorStore:
         for key, vector, metadata in items:
             if not isinstance(key, str) or not key:
                 raise ValueError("vector keys must be non-empty strings")
+            require_unicode(key, "a vector key")
             batch[key] = (np.asarray(vector, dtype=np.float32).reshape(-1), metadata or {})
         if not batch:
             return 0
@@ -1147,7 +1208,7 @@ class VectorStore:
         def check(state: _IndexState) -> bool:
             if vecs is None or vecs.shape[1] != state.dim:
                 raise ValueError(f"vectors must have the index's dimension, {state.dim}; got {sorted(dims)}")
-            if state.metric == "cosine" and not np.linalg.norm(vecs, axis=1).all():
+            if state.metric == "cosine" and not row_norms(vecs).all():
                 raise ValueError("an all-zero vector has no direction; it can't be stored in a cosine index")
             for key, kid in zip(keys, ids):
                 owner = state.docs.get(kid)
@@ -1215,10 +1276,9 @@ class VectorStore:
             if q.shape[1] != state.dim:
                 raise ValueError(f"query vector must have the index's dimension, {state.dim}; got {q.shape[1]}")
             if state.metric == "cosine":
-                norm = float(np.linalg.norm(q))
-                if norm == 0:
+                if not row_norms(q).all():
                     raise ValueError("an all-zero query vector has no direction for cosine distance")
-                q = q / norm
+                q = unit_rows(q)
             hits = self._search(state, q, top_k, filter)
             out = []
             for d, doc in hits:
@@ -1264,6 +1324,7 @@ class VectorStore:
             validate_doc_id(doc_id)
             if not isinstance(text, str):
                 raise ValueError(f"text for {doc_id!r} must be a string")  # noqa: TRY004 -- API maps ValueError to 400
+            require_unicode(text, f"text for {doc_id!r}")
             batch[doc_id] = (text, validate_metadata(metadata))
         if not batch:
             return 0
@@ -1418,6 +1479,7 @@ def _split_parts(records: list[tuple], dim: int) -> list[bytes]:
     return parts
 
 
+@_corrupt_on_error("v3 index")
 def _decode_v3(blob: bytes, key: str) -> tuple[int, list[tuple]]:
     """(dim, records) from a v3 single-object index."""
     if not blob.startswith(LEGACY_V3_MAGIC):
