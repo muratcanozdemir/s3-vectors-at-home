@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from vectorstore import core
+from vectorstore import vectors as vector_search
 from vectorstore.filters import (
     _is_scalar,
     _require_unicode,
@@ -246,7 +247,14 @@ class S3VectorsService:
         account_id: str | None = None,
         compaction: str = "background",
         cache: core.IndexCache | None = None,
+        search: str | None = None,
+        graph_build: str = "background",
     ):
+        """`search` is how new indexes are searched, "exact" or
+        "approximate" (default: S3VAH_S3VECTORS_SEARCH, else exact); see
+        vectorstore.vectors. Indexes keep the mode they were created with."""
+        self.search = vector_search.search_config(search or os.environ.get("S3VAH_S3VECTORS_SEARCH", "").strip() or None)
+        self._graph_build = graph_build
         self.region = region or os.environ.get("S3VAH_REGION", "us-east-1")
         self.account_id = account_id or os.environ.get("S3VAH_ACCOUNT_ID", "000000000000")
         self._client = client
@@ -257,8 +265,10 @@ class S3VectorsService:
         self._compactor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s3vectors-compact")
         self._stores: dict[str, core.VectorStore] = {}
         self._stores_lock = threading.Lock()
-        # One memory budget for every vector bucket's loaded indexes.
+        # One memory budget for every vector bucket's loaded indexes, and
+        # one thread building HNSW graphs for all of them.
         self._cache = cache or core.IndexCache()
+        self._graph_builder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="s3vectors-graph")
         # Holds no indexes; used for the registry objects, and runs the one
         # startup check that the object store enforces conditional writes.
         self._registry = self._new_store("_registry", verify=True)
@@ -277,6 +287,8 @@ class S3VectorsService:
             compactor=self._compactor,
             verify_conditional_writes=verify,
             cache=self._cache,
+            graph_build=self._graph_build,
+            graph_builder=self._graph_builder,
         )
 
     def _store(self, vector_bucket: str) -> core.VectorStore:
@@ -466,7 +478,7 @@ class S3VectorsService:
         self._require_bucket(bucket)
         store = self._store(bucket)
         try:
-            store.create_index(index, dim, metric, config)
+            store.create_index(index, dim, metric, config, search=self.search)
         except core.IndexAlreadyExistsError:
             raise _conflict(f"index {index!r} already exists in {bucket!r}") from None
         if self._read_bucket(bucket) is None:  # the bucket is being (or was) deleted: undo

@@ -142,6 +142,7 @@ s3v.delete_vector_bucket(vectorBucketName="help-center")
 
 ### Behaviour where AWS's documentation leaves it open
 
+- **Search:** exact by default. Amazon's service searches approximately. Set `S3VAH_S3VECTORS_SEARCH=approximate` to create new indexes that use an HNSW graph, which is much faster on large indexes; see [Operations](operations.md#approximate-search).
 - **Distances:** cosine `distance` is 1 − cosine similarity (0 = same direction). Euclidean is the plain, not squared, distance. Results come closest first.
 - **Missing keys:** `GetVectors` leaves out keys that don't exist, and `DeleteVectors` ignores them.
 - **Non-filterable keys:** filtering on one is a `ValidationException`, not an empty result.

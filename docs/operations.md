@@ -39,7 +39,8 @@ Every worker process keeps each index it has used in memory: vectors, text and m
 - **The budget:** `S3VAH_CACHE_MB` caps what one process holds across all its indexes, text and S3 Vectors alike. When the total goes over, the indexes used least recently are dropped. The next request for a dropped index reloads it from MinIO (about 0.3 s for 50,000 documents), so set the budget above what your busy indexes need, and let it trim the ones used rarely.
 - **The index in use** is never dropped. An index bigger than the whole budget still works; it's just the only one kept.
 - **Without a budget** (the default), nothing is dropped, as in earlier versions.
-- **Watching it:** `GET /status` reports this worker's `cache`: how many indexes it holds, their estimated `bytes`, the `max_bytes` budget, and the `evictions` so far. Frequent evictions mean the budget is too small for the working set. The size is an estimate, within about 5% of measured memory for 384- and 1,024-dimension indexes.
+- **Approximate indexes** count their graph too, and the field indexes filters build.
+- **Watching it:** `GET /status` reports this worker's `cache`: how many indexes it holds, their estimated `bytes`, the `max_bytes` budget, and the `evictions` so far. Frequent evictions mean the budget is too small for the working set. The size is an estimate: it came within about 10% of measured memory for 384- and 1,024-dimension indexes.
 - **With several workers,** each has its own budget: total memory is up to `WEB_CONCURRENCY` × `S3VAH_CACHE_MB`, plus about 240 MB per worker for the server and the model before any index is loaded.
 
 ## Compaction
@@ -81,6 +82,27 @@ Measured on a laptop against local MinIO.
 | 50,000 docs | 565 ms / 88 MB | ~6–12 ms / ~6 KB |
 
 **Loading** a 50,000-document index from scratch takes about 0.3 s. The API loads the model and the default index at startup, so the first request isn't slow.
+
+## Approximate search
+
+Every index searches exactly unless it's created as approximate: with `"search": "approximate"` in the text API, `--approximate` in the CLI, or `S3VAH_S3VECTORS_SEARCH=approximate` for new S3 Vectors indexes. An approximate index searches an HNSW graph instead of comparing the query with every vector.
+
+Measured on 100,000 clustered 384-dimension vectors, top 10:
+
+| Search | Exact index | Approximate index | Recall |
+|---|---|---|---|
+| no filter | 7.6 ms | 0.2 ms | 100% |
+| filter matching 1% | 0.3 ms | 0.3 ms | 100% |
+| filter matching 25% | 8 ms | 5 ms | 100% |
+| filter matching 60% | 15 ms | 11 ms | 100% |
+
+- **When it's worth it:** for large indexes searched often, without a filter or with broad filters. Below 2,000 vectors no graph is built at all, since exact search is already well under a millisecond.
+- **Recall:** the true top 10 came back for every test query here, but approximate means not guaranteed. Real embeddings are clustered, which suits graphs; data spread uniformly in many dimensions is much harder. Measure with your own data: send the same search with `"exact": true` and compare. Raising `ef_search` improves recall.
+- **Filters:** a filter that matches at most 20,000 vectors or 5% of the index is searched exactly over just those vectors, which is both fast and exact. A broader one searches the graph, skipping documents that don't match.
+- **Building the graph:** the graph is built in the background, with `S3VAH_GRAPH_BUILD_THREADS` threads, when the index is loaded and again after many deletes. Until it's built, searches are exact, and `/status` shows `"graph_ready": false`. For 100,000 vectors, loading took 1.6 s and the graph was ready 3 s later, using 8 threads. The graph isn't stored in MinIO, so each worker builds its own after a restart.
+- **Writes** go into the graph as they arrive: about 0.1 ms a vector on one thread, with bigger writes spread over the build threads. Bulk loading 100,000 vectors in batches of 5,000 took about 5 s, against 1.3 s for an exact index.
+- **Deletes** leave a gap in the graph that searches skip. Once more than a quarter of it is gaps, the index is compacted and the graph rebuilt in the background.
+- **Memory:** the graph adds about 400–500 bytes a vector (with the default `m` of 32). While a graph is being built, the index's vectors are held twice.
 
 ## Limits
 

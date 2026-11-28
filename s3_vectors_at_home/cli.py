@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 
 from minio.error import S3Error
@@ -45,14 +46,14 @@ def cmd_search(args):
     flt = _json_arg(args.filter, "filter") if args.filter else None
     store = get_store()
     if args.passages:
-        for r in store.search_with_scores(args.query, args.top_k, index=args.index, filter=flt, passages=True):
+        for r in store.search_with_scores(args.query, args.top_k, index=args.index, filter=flt, passages=True, exact=args.exact):
             print(f"{r['score']:.4f}  {r['doc_id']}  [{r['span'][0]}:{r['span'][1]}]")
             print("    " + " ".join(r["passage"].split()))
     elif args.scores:
-        for r in store.search_with_scores(args.query, args.top_k, index=args.index, filter=flt):
+        for r in store.search_with_scores(args.query, args.top_k, index=args.index, filter=flt, exact=args.exact):
             print(f"{r['score']:.4f}  {r['doc_id']}")
     else:
-        print("Matches:", store.search(args.query, args.top_k, index=args.index, filter=flt))
+        print("Matches:", store.search(args.query, args.top_k, index=args.index, filter=flt, exact=args.exact))
 
 
 def cmd_get(args):
@@ -83,6 +84,8 @@ def cmd_status(args):
     print(f"Index: {args.index}")
     stats = store.index_stats(index=args.index)
     print(f"Documents: {stats['documents']} ({stats['vectors']} vectors)")
+    if stats["search"] == "approximate":
+        print(f"Search: approximate (graph {'ready' if stats['graph_ready'] else 'building; searching exactly meanwhile'})")
     print(f"Segments: {stats['segments']} ({stats['bytes']:,} bytes)")
     print(f"Embedding model: {store.embedding_model_name()}")
 
@@ -93,7 +96,12 @@ def cmd_indexes_list(_args):
 
 
 def cmd_indexes_create(args):
-    get_store().create_index(args.name)
+    search = None
+    if args.approximate:
+        search = {"mode": "approximate", "m": args.m, "ef_construction": args.ef_construction, "ef_search": args.ef_search}
+    elif any(v is not None for v in (args.m, args.ef_construction, args.ef_search)):
+        raise ValueError("--m, --ef-construction and --ef-search need --approximate")
+    get_store().create_index(args.name, search=search)
     print(f"Created index {args.name}")
 
 
@@ -108,6 +116,9 @@ def cmd_indexes_delete(args):
 
 
 def main():
+    # A CLI run is over in seconds: building an approximate index's graph
+    # would only make it wait at exit. Its searches are exact instead.
+    os.environ.setdefault("S3VAH_GRAPH_BUILD", "off")
     ap = argparse.ArgumentParser(description="S3 Vectors at Home CLI")
     # Every document command takes --index, after the subcommand name.
     index_opt = argparse.ArgumentParser(add_help=False)
@@ -130,6 +141,7 @@ def main():
     s.add_argument("--filter", help='metadata filter as JSON, e.g. \'{"lang": "en"}\'')
     s.add_argument("--scores", action="store_true", help="Print one 'score  doc_id' line per match")
     s.add_argument("--passages", action="store_true", help="Also print each match's best-matching passage")
+    s.add_argument("--exact", action="store_true", help="On an approximate index, compare against every vector")
     s.set_defaults(func=cmd_search)
 
     g = subp.add_parser("get", parents=[index_opt], help="Get a document by id")
@@ -153,6 +165,10 @@ def main():
     ixs.add_parser("list", help="List indexes").set_defaults(func=cmd_indexes_list)
     c = ixs.add_parser("create", help="Create an index")
     c.add_argument("name")
+    c.add_argument("--approximate", action="store_true", help="Search with an HNSW graph: much faster on large indexes, not always exact")
+    c.add_argument("--m", type=int, help="HNSW links per vector (4-128, default 32)")
+    c.add_argument("--ef-construction", type=int, help="HNSW build-time candidate list (8-1024, default 64)")
+    c.add_argument("--ef-search", type=int, help="HNSW search-time candidate list (8-4096, default 64)")
     c.set_defaults(func=cmd_indexes_create)
     dl = ixs.add_parser("delete", help="Delete an index and all its documents")
     dl.add_argument("name")

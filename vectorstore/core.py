@@ -21,7 +21,14 @@ from minio.error import S3Error
 
 from minio import Minio
 from vectorstore.embedding import DEFAULT_CHUNK_OVERLAP, MODEL_NAME, OnnxEmbedder
-from vectorstore.filters import matches, validate_filter, validate_metadata
+from vectorstore.filters import FilterIndex, validate_filter, validate_metadata
+from vectorstore.vectors import (
+    APPROXIMATE,
+    FlatVectors,
+    HnswVectors,
+    build_threads_from_env,
+    search_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -393,39 +400,52 @@ def chunk_label(doc_id: str, chunk: int) -> int:
 
 
 class _IndexState:
-    """One index in memory: the FAISS index plus every document's fields.
+    """One index in memory: its vectors plus every document's fields.
 
     `docs` maps a document's id (`object_key_id`) -> {"doc_id", "text",
     "metadata"}, plus "spans" and "labels" for a document split into
-    chunks. `by_id` is the reverse lookup, derived from `docs`. FAISS holds
-    one vector per chunk: chunk 0 under the document's id, chunk i under
-    `chunk_label(doc_id, i)`; `owner` maps each of the latter to
-    (document id, i).
+    chunks. `by_id` is the reverse lookup, derived from `docs`. `vectors`
+    (see vectorstore.vectors) holds one vector per chunk: chunk 0 under the
+    document's id, chunk i under `chunk_label(doc_id, i)`; `owner` maps each
+    of the latter to (document id, i). `filters` indexes the metadata
+    fields filters have used, built on the first filtered search.
     """
 
-    __slots__ = ("_vector_bytes", "by_id", "dim", "docs", "faiss", "metric", "nbytes", "owner", "raw")
+    __slots__ = ("_filter_entries", "_vector_bytes", "by_id", "dim", "docs", "filters", "metric", "nbytes",
+                 "owner", "raw", "vectors")
 
-    def __init__(self, dim: int, metric: str = "cosine", raw: bool = False):
-        # FAISS always measures squared L2. For "cosine" the vectors it holds
-        # are unit length (text embeddings already are; raw vectors are
+    def __init__(self, dim: int, metric: str = "cosine", raw: bool = False, vectors=None):
+        # Vectors are compared by squared L2 distance. For "cosine" they are
+        # unit length (text embeddings already are; raw vectors are
         # normalised on the way in), so cosine distance is d/2. With `raw`,
         # each doc also keeps the vector it was given, returned as-is.
         self.dim = dim
         self.metric = metric
         self.raw = raw
-        self.faiss = faiss.IndexIDMap2(faiss.IndexFlatL2(dim))
+        self.vectors = vectors or FlatVectors(dim)
         self.docs: dict[int, dict] = {}
         self.by_id: dict[str, int] = {}
         self.owner: dict[int, tuple[int, int]] = {}
+        self.filters: FilterIndex | None = None
         # Estimated memory held, kept up to date by `apply` (see `_batch_bytes`).
         self.nbytes = 0
-        self._vector_bytes = int(4.4 * dim) + 56 + (4 * dim + 112 if raw else 0)
+        self._filter_entries = 0  # filter index entries counted in nbytes
+        self._vector_bytes = (
+            int(4.4 * dim) + 56 + (4 * dim + 112 if raw else 0) + self.vectors.extra_bytes_per_vector
+        )
+
+    def _count_filter_bytes(self):
+        # ~100 bytes a (document, value) entry: a set slot plus its share of the value's dict entry.
+        entries = self.filters.entries if self.filters is not None else 0
+        self.nbytes += 100 * (entries - self._filter_entries)
+        self._filter_entries = entries
 
     def apply(self, latest: dict[str, tuple]):
         """Make each doc_id in `latest` ({doc_id: record}) match its record."""
         if not latest:
             return
         keys = {doc_id: object_key_id(doc_id) for doc_id in latest}
+        filters = self.filters
         if self.docs:
             gone = []
             for k in keys.values():
@@ -433,6 +453,8 @@ class _IndexState:
                 if doc is None:
                     continue
                 del self.by_id[doc["doc_id"]]
+                if filters is not None:
+                    filters.remove(k, doc["metadata"])
                 self.nbytes -= _batch_bytes(
                     self._vector_bytes,
                     [(None, doc["doc_id"], doc["text"], doc["metadata"], None, doc.get("spans"))],
@@ -443,9 +465,10 @@ class _IndexState:
                     del self.owner[label]
                     gone.append(label)
             if gone:
-                self.faiss.remove_ids(np.array(gone, dtype="int64"))
+                self.vectors.remove(np.array(gone, dtype="int64"))
         upserts = [rec for rec in latest.values() if rec[2] is not None]
         if not upserts:
+            self._count_filter_bytes()
             return
         chunked = any(rec[5] for rec in upserts)
         counts = [len(rec[5]) if rec[5] else 1 for rec in upserts] if chunked else None
@@ -474,35 +497,47 @@ class _IndexState:
             docs[key] = doc
             by_id[doc_id] = key
             row += n
+        if filters is not None:
+            for rec in upserts:
+                filters.add(keys[rec[1]], rec[3])
         self.nbytes += _batch_bytes(self._vector_bytes, upserts, row)
-        self.faiss.add_with_ids(np.ascontiguousarray(searchable, dtype=np.float32), np.array(labels, dtype="int64"))
+        self._count_filter_bytes()
+        self.vectors.add(np.ascontiguousarray(searchable, dtype=np.float32), np.array(labels, dtype="int64"))
 
-    def search(self, q: np.ndarray, top_k: int, filter: dict | None) -> list[tuple[float, dict, int]]:
+    def matching(self, filter: dict) -> set[int]:
+        """Ids of the documents whose metadata matches `filter`."""
+        if self.filters is None:
+            self.filters = FilterIndex(self.docs, metadata=lambda doc: doc["metadata"])
+        selected = self.filters.select(filter)
+        self._count_filter_bytes()
+        return selected
+
+    def search(
+        self, q: np.ndarray, top_k: int, filter: dict | None, exact: bool = False
+    ) -> list[tuple[float, dict, int]]:
         """[(squared L2 distance, doc, chunk)] of the top_k closest documents
         matching `filter`, closest first. A chunked document counts once, at
-        its closest chunk. Exact: FAISS is asked for more vectors until
-        top_k distinct documents are found or every candidate has been seen."""
-        params = None
+        its closest chunk: more vectors are asked for until top_k distinct
+        documents are found or every candidate has been seen. Exact unless
+        the index searches approximately (and `exact` isn't set)."""
+        allowed = None
         if filter:
-            allowed = [k for k, d in self.docs.items() if matches(filter, d["metadata"])]
-            if self.owner:
-                allowed += [label for k in allowed for label in self.docs[k].get("labels", ())]
-            if not allowed:
+            keys = self.matching(filter)
+            if not keys:
                 return []
+            if self.owner:
+                keys = [*keys, *(label for k in keys for label in self.docs[k].get("labels", ()))]
+            allowed = keys  # labels: a document's id is its first chunk's
             candidates = len(allowed)
-            params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(np.array(allowed, dtype="int64")))
         else:
-            candidates = self.faiss.ntotal
+            candidates = self.vectors.ntotal
             if candidates == 0:
                 return []
         k = min(top_k * 2 if self.owner else top_k, candidates)
         while True:
-            distances, ids = self.faiss.search(q, k, params=params)
+            distances, labels = self.vectors.search(q, k, allowed, exact)
             hits, seen = [], set()
-            # FAISS pads short result sets with id -1: skip those.
-            for d, label in zip(distances[0].tolist(), ids[0].tolist()):
-                if label == -1:
-                    continue
+            for d, label in zip(distances, labels):
                 key, chunk = self.owner.get(label, (label, 0))
                 if key in seen:
                     continue
@@ -560,7 +595,9 @@ class IndexCache:
             while self._total > self.max_bytes and len(self._entries) > 1:
                 vkey, (vstore, vname, _) = next(iter(self._entries.items()))
                 self._discard(vkey)
-                vstore._cache.pop(vname, None)
+                evicted = vstore._cache.pop(vname, None)
+                if evicted is not None:
+                    evicted.state.vectors.close()  # don't finish building a graph nobody will use
                 self.evictions += 1
                 logger.debug("dropped index %r from memory to stay within %s bytes", vname, self.max_bytes)
 
@@ -622,10 +659,14 @@ class _Cached:
         self.etag, self.manifest, self.state, self.applied = etag, manifest, state, applied
 
 
-def _new_manifest(dim: int, incarnation: str, metric: str = "cosine", raw: bool = False, config=None) -> dict:
+def _new_manifest(
+    dim: int, incarnation: str, metric: str = "cosine", raw: bool = False, config=None, search=None
+) -> dict:
     # "metric": "cosine" or "euclidean". "raw": the index holds caller-given
     # vectors (S3 Vectors API) rather than unit-length text embeddings.
     # "config": free-form settings of the API that created the index.
+    # "search": how it's searched (vectorstore.vectors.search_config);
+    # manifests without one (older ones) are searched exactly.
     return {
         "format": FORMAT,
         "incarnation": incarnation,
@@ -634,14 +675,11 @@ def _new_manifest(dim: int, incarnation: str, metric: str = "cosine", raw: bool 
         "raw": raw,
         "created": time.time(),
         "config": config or {},
+        "search": search or search_config(),
         "next_seq": 1,
         "segments": [],
         "writers": {},
     }
-
-
-def _state_for(manifest: dict) -> "_IndexState":
-    return _IndexState(manifest["dim"], manifest.get("metric", "cosine"), manifest.get("raw", False))
 
 
 def _encode_manifest(manifest: dict) -> bytes:
@@ -713,6 +751,9 @@ class VectorStore:
         verify_conditional_writes: bool = True,
         chunk_overlap: int | None = DEFAULT_CHUNK_OVERLAP,
         cache: IndexCache | None = None,
+        graph_build: str = "background",
+        graph_builder: ThreadPoolExecutor | None = None,
+        graph_build_threads: int | None = None,
     ):
         """`prefix`, `default_index`, `index_name_re` and `raw_vectors` let one
         bucket hold several independent namespaces of indexes (the S3
@@ -732,9 +773,20 @@ class VectorStore:
         `cache` is the process's memory budget for loaded indexes, shared
         between stores (see IndexCache); by default the store has its own,
         unlimited one.
+
+        Approximate-search indexes build their HNSW graphs on `graph_builder`
+        (shared between stores like `io_pool`; default: one thread of the
+        store's own) with `graph_build_threads` threads each (default:
+        S3VAH_GRAPH_BUILD_THREADS, or half the cores). `graph_build="inline"`
+        builds them before the write or load returns instead, for tests, and
+        "off" never builds them: approximate indexes are searched exactly
+        (for short-lived processes such as the CLI, which would otherwise
+        wait at exit for a graph nobody will use).
         """
         if compaction not in ("background", "inline", "off"):
             raise ValueError("compaction must be 'background', 'inline' or 'off'")
+        if graph_build not in ("background", "inline", "off"):
+            raise ValueError("graph_build must be 'background', 'inline' or 'off'")
         self._prefix = prefix
         self._default = default_index
         self._name_re = index_name_re
@@ -747,6 +799,9 @@ class VectorStore:
         self._io = io_pool or ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
         self._cache: dict[str, _Cached] = {}
         self._cache_budget = cache or IndexCache()
+        self._graph_build = graph_build
+        self._graph_builder = graph_builder
+        self._graph_build_threads = graph_build_threads or build_threads_from_env()
         self._dim: int | None = None
         # Identifies this store's writes in manifests; see `_commit`.
         self._writer_id = uuid.uuid4().hex[:16]
@@ -897,6 +952,28 @@ class VectorStore:
             self._dim = int(self._embed("dimension probe").shape[0])
         return self._dim
 
+    def _new_state(self, manifest: dict) -> "_IndexState":
+        dim = manifest["dim"]
+        search = manifest.get("search") or search_config()
+        vectors = None
+        if search["mode"] == APPROXIMATE:
+            builder = None
+            if self._graph_build == "background":
+                if self._graph_builder is None:
+                    self._graph_builder = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vectorstore-graph")
+                builder = self._graph_builder
+            vectors = HnswVectors(
+                dim,
+                m=search["m"],
+                ef_construction=search["ef_construction"],
+                ef_search=search["ef_search"],
+                lock=self._lock,
+                builder=builder,
+                build_threads=self._graph_build_threads,
+                build=self._graph_build != "off",
+            )
+        return _IndexState(dim, manifest.get("metric", "cosine"), manifest.get("raw", False), vectors)
+
     # -- the in-memory cache ----------------------------------------------------
     # Every change to `self._cache` goes through these, so the process-wide
     # IndexCache knows what is held and can evict to stay in its budget.
@@ -998,7 +1075,7 @@ class VectorStore:
         else:
             with _gc_paused():
                 latest = {d: r for d, r in _latest(self._fetch(manifest, entries)).items() if r[2] is not None}
-                state = _state_for(manifest)
+                state = self._new_state(manifest)
                 state.apply(latest)
             return _Cached(etag, manifest, state, applied)
         state.apply(latest)
@@ -1027,12 +1104,12 @@ class VectorStore:
                 continue  # someone else created it first: use theirs
         raise IndexWriteConflictError("index kept changing while being created; retry the operation")
 
-    def _create(self, name: str, dim: int, records: list[tuple], metric: str = "cosine", config=None):
+    def _create(self, name: str, dim: int, records: list[tuple], metric: str = "cosine", config=None, search=None):
         """Create the manifest, with `records` (seq None) as its first segment.
 
         Raises _WriteConflict if the index already exists.
         """
-        manifest = _new_manifest(dim, uuid.uuid4().hex[:16], metric, self._raw, config)
+        manifest = _new_manifest(dim, uuid.uuid4().hex[:16], metric, self._raw, config, search)
         seg_key = None
         if records:
             blob = _encode_segment(dim, records)
@@ -1331,20 +1408,27 @@ class VectorStore:
                     names.add(obj.object_name[len(prefix): -len(suffix)])
         return sorted(names)
 
-    def create_index(self, name: str, dim: int | None = None, metric: str = "cosine", config=None) -> None:
+    def create_index(
+        self, name: str, dim: int | None = None, metric: str = "cosine", config=None, search: dict | None = None
+    ) -> None:
         """Create an empty index. `dim` defaults to the embedder's.
 
         `metric` ("cosine" or "euclidean") and `config` (any JSON, returned by
         `index_info`) matter to raw-vector indexes; text indexes are cosine.
+        `search` is {"mode": "exact"} (the default) or {"mode": "approximate",
+        and optionally "m", "ef_construction", "ef_search"}: see
+        vectorstore.vectors. It's fixed for the index's lifetime.
         """
         self._check_name(name)
         if metric not in ("cosine", "euclidean"):
             raise ValueError("metric must be 'cosine' or 'euclidean'")
+        search = dict(search or {})
+        search = search_config(search.pop("mode", None), **search)
         if name == self._default or self._etag(self._v3key(name)) is not None:
             raise IndexAlreadyExistsError(name)
         with self._lock:
             try:
-                self._create(name, dim or self._embedding_dim(), [], metric, config)
+                self._create(name, dim or self._embedding_dim(), [], metric, config, search)
             except _WriteConflict:
                 raise IndexAlreadyExistsError(name) from None
 
@@ -1363,6 +1447,7 @@ class VectorStore:
             "metric": m.get("metric", "cosine"),
             "created": m.get("created", 0.0),
             "config": m.get("config", {}),
+            "search": m.get("search") or search_config(),
         }
 
     def delete_index(self, name: str) -> None:
@@ -1402,17 +1487,21 @@ class VectorStore:
         return self.index_stats(index)
 
     def index_stats(self, index: str = DEFAULT_INDEX) -> dict:
-        """{"documents", "vectors", "segments", "bytes"} (vectors: one per chunk;
-        bytes: all segments, live or not)."""
+        """{"documents", "vectors", "segments", "bytes", "search", "graph_ready"}
+        (vectors: one per chunk; bytes: all segments, live or not; search:
+        "exact" or "approximate"; graph_ready: whether an approximate index's
+        graph is built, so searches use it, or still exact)."""
         self._check_name(index)
         with self._lock:
             cached = self._ensure(index)
             entries = cached.manifest["segments"]
             return {
                 "documents": len(cached.state.docs),
-                "vectors": cached.state.faiss.ntotal,
+                "vectors": cached.state.vectors.ntotal,
                 "segments": len(entries),
                 "bytes": sum(e["bytes"] for e in entries),
+                "search": cached.state.vectors.mode,
+                "graph_ready": getattr(cached.state.vectors, "has_graph", False),
             }
 
     # -- raw vectors (the S3 Vectors API) -------------------------------------
@@ -1496,9 +1585,12 @@ class VectorStore:
             self._commit(index, [(None, k, None, None, None, None) for k in keys], lambda state: any(k in state.by_id for k in keys))
         self._after_write(index)
 
-    def query_vectors(self, index: str, vector, top_k: int, filter: dict | None = None) -> tuple[str, list[dict]]:
+    def query_vectors(
+        self, index: str, vector, top_k: int, filter: dict | None = None, exact: bool = False
+    ) -> tuple[str, list[dict]]:
         """(metric, [{"key", "distance", "metadata"}]) for the top_k closest
-        vectors (exact search), closest first. Distance is 1 - cosine
+        vectors, closest first: exact, unless the index searches
+        approximately and `exact` isn't set. Distance is 1 - cosine
         similarity for "cosine", plain Euclidean distance for "euclidean"."""
         self._check_name(index)
         q = np.asarray(vector, dtype=np.float32).reshape(1, -1)
@@ -1514,7 +1606,7 @@ class VectorStore:
                 if not row_norms(q).all():
                     raise ValueError("an all-zero query vector has no direction for cosine distance")
                 q = unit_rows(q)
-            hits = state.search(q, top_k, filter)
+            hits = state.search(q, top_k, filter, exact)
             out = []
             for d, doc, _ in hits:
                 dist = d / 2.0 if state.metric == "cosine" else float(np.sqrt(max(d, 0.0)))
@@ -1616,9 +1708,11 @@ class VectorStore:
         self._after_write(index)
         return found
 
-    def search(self, query: str, top_k: int = 5, index: str = DEFAULT_INDEX, filter: dict | None = None) -> list[str]:
+    def search(
+        self, query: str, top_k: int = 5, index: str = DEFAULT_INDEX, filter: dict | None = None, exact: bool = False
+    ) -> list[str]:
         """doc_ids of the top_k closest matching documents, closest first."""
-        return [r["doc_id"] for r in self.search_with_scores(query, top_k, index=index, filter=filter)]
+        return [r["doc_id"] for r in self.search_with_scores(query, top_k, index=index, filter=filter, exact=exact)]
 
     def search_with_scores(
         self,
@@ -1627,12 +1721,15 @@ class VectorStore:
         index: str = DEFAULT_INDEX,
         filter: dict | None = None,
         passages: bool = False,
+        exact: bool = False,
     ) -> list[dict]:
         """Top_k matches as [{"doc_id", "score", "metadata"}], closest first.
 
         `filter` (see vectorstore.filters) restricts the search to documents
-        whose metadata matches; the search is still exact, i.e. these are the
-        true top_k among the matching documents. `score` is cosine
+        whose metadata matches. On an exact index (the default) these are
+        the true top_k among the matching documents; on an approximate one,
+        almost always the same, unless `exact` asks for a full comparison
+        (see vectorstore.vectors). `score` is cosine
         similarity (-1..1, higher is closer): vectors are unit-normalised,
         so it is 1 - d/2 from FAISS's squared L2 distance d. A long document
         is split into chunks, and scores as its closest chunk; with
@@ -1649,7 +1746,7 @@ class VectorStore:
         with self._lock:
             state = self._ensure(index).state
             out = []
-            for d, doc, chunk in state.search(qv, top_k, filter):
+            for d, doc, chunk in state.search(qv, top_k, filter, exact):
                 hit = {"doc_id": doc["doc_id"], "score": float(1.0 - d / 2.0), "metadata": _copy_metadata(doc["metadata"])}
                 if passages:
                     start, end = doc["spans"][chunk] if "spans" in doc else (0, len(doc["text"]))
@@ -1832,5 +1929,6 @@ def get_store() -> VectorStore:
                     OnnxEmbedder.from_hub(),
                     chunk_overlap=_chunk_overlap_from_env(),
                     cache=IndexCache(_cache_budget_from_env()),
+                    graph_build=os.environ.get("S3VAH_GRAPH_BUILD", "").strip() or "background",
                 )
     return _store
