@@ -1,0 +1,28 @@
+# Changelog
+
+## 0.1.0 (2026-11-28)
+
+
+### Features
+
+* Amazon S3 Vectors API, compatible with the AWS SDKs ([5790f79](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/5790f799a6ffe462d18c372f6a0b3849f2391027))
+* Amazon S3 Vectors API, compatible with the AWS SDKs ([bf4e583](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/bf4e5831de8d0dfab08eaaacab9bd9c2619eca90))
+* batch bulk upload, cache FAISS index in memory, bound paging/top_k ([#5](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/5)) ([3cdac5e](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/3cdac5eb24a475a606d9fb991b45dc30c26a233f))
+* container image and `docker compose up` for MinIO + API ([4369e05](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/4369e05ce30710a1e49cf63485c5bad348cb1bc8))
+* container image and docker compose up for MinIO + API (and fix the wheel) ([01d617a](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/01d617ad20357f5a3a3772a09a1ff0d0c67fed15))
+* metadata, filtered search, and named indexes ([#9](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/9)) ([c7e736b](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/c7e736b31a413a5b5ce546911a5d93d507134843))
+* register in Murat's software catalog, add LICENSE ([72bbbce](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/72bbbceda4a54c9b49b06058789e9c078995507d))
+
+
+### Bug Fixes
+
+* 7 bugs found by new edge-case and property test suites ([68fd38c](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/68fd38c7d393f9d66956f3cc4fe5b9f1d9226830))
+* **ci:** replace removed minio/minio image with chainguard/minio ([66adaa9](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/66adaa9595294cb268f64478bf7e1361c6a0599d))
+* make index writes safe across processes with conditional PUTs ([#7](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/7)) ([cea9670](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/cea9670135065b5dcfd19f14f4ed82c19c8df201))
+* repair broken deps/CI, fix search+index correctness bugs, add golden tests ([2fc03e6](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/2fc03e6ddcea4fcf764b6cd72dee88f8091d6ba0))
+
+
+### Performance Improvements
+
+* embed with ONNX Runtime instead of PyTorch ([#11](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/11)) ([8cb75dc](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/8cb75dc9e9d9fd35ce35a89577452c8b778c929b))
+* segmented index layout, so writes cost the same at any size ([#12](https://github.com/muratcanozdemir/s3-vectors-at-home/issues/12)) ([2ce6b59](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/2ce6b59e1e29bb4b7db3b68d25b07152b480fc22))
