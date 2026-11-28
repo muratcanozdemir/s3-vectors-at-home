@@ -62,10 +62,17 @@ Dependencies are locked in `uv.lock`, which is committed, so `uv sync` is reprod
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please).
 
-1. **Write [Conventional Commits](https://www.conventionalcommits.org/).** `feat:`, `fix:`, `perf:` and `deps:` appear in the changelog. `docs:`, `chore:`, `ci:`, `test:` and `refactor:` don't.
-2. **Every push to `main` updates a release PR.** It bumps the version in `pyproject.toml`, `uv.lock` and `.release-please-manifest.json`, and adds the new commits to `CHANGELOG.md`.
+1. **Give every PR a [Conventional Commit](https://www.conventionalcommits.org/) title,** such as `fix: …`, `feat: …` or `docs: …`. PRs are squash-merged, so the title becomes the one commit on `main` that release-please reads. `feat:`, `fix:`, `perf:` and `deps:` appear in the changelog. `docs:`, `chore:`, `ci:`, `test:` and `refactor:` don't. A title without a prefix is left out of the changelog, along with everything in that PR.
+2. **Every push to `main` updates a release PR.** It bumps the version in `pyproject.toml`, `uv.lock` and `.release-please-manifest.json`, and adds the new entries to `CHANGELOG.md`.
 3. **Merging the release PR ships it.** CI tags `v<version>` and creates the GitHub release. It then publishes the wheel to PyPI with Trusted Publishing, and pushes the image to `ghcr.io` as `<version>`, `<major.minor>` and `latest`, after the tests and the image smoke test pass.
 
 Don't edit the version by hand: CI fails if the three files disagree.
 
-PRs are merged with merge commits. **Give PRs plain titles, without a `feat:`-style prefix.** The merge commit's message repeats the PR title, so a prefixed title would put each change in the changelog twice. The changelog comes from the commits inside the PR.
+**One PR, several changelog entries.** Add a commit override at the end of the PR description, one Conventional Commit per line. It also fixes a PR that's already merged: edit its description, and the next release PR picks it up.
+
+```
+BEGIN_COMMIT_OVERRIDE
+fix(ci): tag images without the v
+fix(compose): give MinIO the same credentials as the API
+END_COMMIT_OVERRIDE
+```
