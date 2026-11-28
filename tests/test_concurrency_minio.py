@@ -108,6 +108,22 @@ def test_concurrent_writer_processes_lose_no_updates(mode, index):
         assert store.search(f"text {doc_id}", top_k=1, index=index) == [doc_id]
         worker = int(doc_id[1: doc_id.index("-")])
         assert store.get_document(doc_id, index=index)["metadata"] == {"worker": worker}
+    _assert_no_orphan_segments(store, bucket, index)
+
+
+def _assert_no_orphan_segments(store, bucket, index):
+    # Every writer and background merge has finished (processes joined), so
+    # every segment in the bucket must be one the manifest references:
+    # failed appends and lost merges clean up after themselves.
+    import json
+
+    from vectorstore.core import manifest_key
+
+    manifest = json.loads(store._get_bytes(manifest_key(index)))
+    referenced = {e["key"] for e in manifest["segments"]}
+    stored = {o.object_name for o in store._client.list_objects(bucket, prefix=f"segments/{index}/", recursive=True)}
+    assert stored == referenced, f"orphans: {sorted(stored - referenced)[:5]}, missing: {sorted(referenced - stored)[:5]}"
+    assert len(referenced) <= 64
 
 
 def test_conditional_put_beyond_multipart_threshold_is_enforced():

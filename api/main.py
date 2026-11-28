@@ -130,11 +130,27 @@ def _document_routes(router: APIRouter, index_dep):
     @router.get("/status")
     def status(index: str = from_route):
         store = get_store()
+        stats = store.index_stats(index=index)
         return {
             "status": "ok",
             "index": index,
-            "document_count": store.count_documents(index=index),
+            "document_count": stats["documents"],
+            "segments": stats["segments"],
+            "storage_bytes": stats["bytes"],
             "embedding_model": store.embedding_model_name(),
+        }
+
+    @router.post("/compact")
+    def compact(index: str = from_route):
+        # Merges happen automatically after writes; this also reclaims space
+        # held by overwritten and deleted documents, and orphaned segments.
+        stats = get_store().compact(index=index)
+        return {
+            "status": "ok",
+            "index": index,
+            "document_count": stats["documents"],
+            "segments": stats["segments"],
+            "storage_bytes": stats["bytes"],
         }
 
 

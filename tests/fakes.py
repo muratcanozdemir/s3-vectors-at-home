@@ -8,12 +8,13 @@ validation) in isolation from MinIO and the real embedding model.
 
 import hashlib
 import threading
-from collections import namedtuple
+from collections import defaultdict, namedtuple
+from datetime import UTC, datetime
 
 import numpy as np
 from minio.error import S3Error
 
-_Object = namedtuple("Object", ["object_name"])
+_Object = namedtuple("Object", ["object_name", "last_modified", "is_dir"])
 _Stat = namedtuple("Stat", ["object_name", "etag"])
 _WriteResult = namedtuple("WriteResult", ["object_name", "etag"])
 
@@ -66,6 +67,9 @@ class FakeMinioClient:
     def __init__(self, enforce_conditions: bool = True):
         self.buckets = set()
         self.objects: dict[str, dict[str, bytes]] = {}
+        # bucket -> key -> last-modified time; tests may backdate entries.
+        # Objects tests put straight into `objects` count as written now.
+        self.mtimes: dict[str, dict[str, datetime]] = defaultdict(dict)
         self.get_counts: dict[str, int] = {}
         self.enforce_conditions = enforce_conditions
         self._write_lock = threading.Lock()
@@ -80,8 +84,12 @@ class FakeMinioClient:
     def put_object(self, bucket, key, data, length):
         payload = data.read()
         with self._write_lock:
-            self.objects[bucket][key] = payload
+            self._store(bucket, key, payload)
         return _WriteResult(key, _etag(payload))
+
+    def _store(self, bucket, key, payload):
+        self.objects[bucket][key] = payload
+        self.mtimes[bucket][key] = datetime.now(UTC)
 
     def _put_object(self, bucket, key, data, headers):
         payload = bytes(data)
@@ -96,7 +104,7 @@ class FakeMinioClient:
                         raise _not_found(bucket, key)
                     if if_match.strip('"') != _etag(current):
                         raise _s3_error("PreconditionFailed", bucket, key)
-            self.objects[bucket][key] = payload
+            self._store(bucket, key, payload)
         return _WriteResult(key, _etag(payload))
 
     def get_object(self, bucket, key):
@@ -116,15 +124,25 @@ class FakeMinioClient:
         try:
             with self._write_lock:
                 del self.objects[bucket][key]
+                self.mtimes[bucket].pop(key, None)
         except KeyError:
             raise _not_found(bucket, key)
 
-    def list_objects(self, bucket, prefix=None):
-        return [
-            _Object(name)
-            for name in sorted(self.objects.get(bucket, {}))
-            if prefix is None or name.startswith(prefix)
-        ]
+    def list_objects(self, bucket, prefix=None, recursive=False):
+        # Like MinIO: without `recursive`, only keys directly under `prefix`,
+        # plus one directory entry per deeper "folder".
+        prefix = prefix or ""
+        out, dirs = [], set()
+        for name in sorted(self.objects.get(bucket, {})):
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix):]
+            if not recursive and "/" in rest:
+                dirs.add(prefix + rest.split("/", 1)[0] + "/")
+                continue
+            mtime = self.mtimes[bucket].setdefault(name, datetime.now(UTC))
+            out.append(_Object(name, mtime, False))
+        return out + [_Object(d, None, True) for d in sorted(dirs)]
 
 
 class FakeEmbedder:

@@ -18,15 +18,15 @@ from vectorstore.core import (
     MAX_PAGE_SIZE,
     MAX_TOP_K,
     VectorStore,
-    index_object_key,
+    manifest_key,
 )
 
-INDEX_OBJ = index_object_key(DEFAULT_INDEX)
+INDEX_OBJ = manifest_key(DEFAULT_INDEX)
 
 
 @pytest.fixture
 def store():
-    return VectorStore(FakeMinioClient(), FakeEmbedder())
+    return VectorStore(FakeMinioClient(), FakeEmbedder(), compaction="inline")
 
 
 def test_add_and_get_document(store):
@@ -167,9 +167,12 @@ def test_add_documents_writes_index_once():
         index_puts.append(key)
         return real_put(bucket, key, data, headers)
 
+    store.count_documents()  # creates the (empty) default index
     client._put_object = counting_put
     store.add_documents([(f"d{i}", f"text {i}") for i in range(10)])
+    # One segment with all ten docs, appended with one manifest write.
     assert index_puts.count(INDEX_OBJ) == 1
+    assert len([k for k in index_puts if k.endswith(".seg")]) == 1
 
 
 def test_add_documents_rejects_whole_batch_on_invalid_id(store):
@@ -298,7 +301,7 @@ def test_list_and_count_read_the_cached_index_not_the_bucket():
     store.add_documents([("b", "beta"), ("a", "alpha"), ("c", "gamma")])
     listed = []
     real_list = client.list_objects
-    client.list_objects = lambda bucket: listed.append(bucket) or real_list(bucket)
+    client.list_objects = lambda bucket, **kw: listed.append(bucket) or real_list(bucket, **kw)
     assert store.count_documents() == 3
     assert [d["doc_id"] for d in store.list_documents(skip=1, limit=5)] == ["b", "c"]
     assert listed == []
@@ -684,7 +687,7 @@ def test_writer_losing_to_index_delete_does_not_resurrect_it():
     b = VectorStore(client, FakeEmbedder())
     a.create_index("tmp")
     a.add_document("x", "t", index="tmp")
-    key = index_object_key("tmp")
+    key = manifest_key("tmp")
     real_put = client._put_object
 
     def b_deletes_index_first(bucket, k, data, headers):
@@ -768,18 +771,18 @@ def test_embedding_dimension_mismatch_is_rejected():
         VectorStore(client, SmallerEmbedder()).add_document("y", "t")
 
 
-def test_index_blob_round_trips(store):
-    from vectorstore.core import _IndexState
-
+def test_index_round_trips_through_the_bucket(store):
     _corpus(store)
-    state = _IndexState.decode(store._client.objects[store._bucket][INDEX_OBJ], INDEX_OBJ)
-    assert state.faiss.ntotal == 4 and sorted(state.by_id) == ["de-new", "en-new", "en-old", "plain"]
-    assert state.docs[state.by_id["en-old"]]["metadata"]["year"] == 2001
+    fresh = VectorStore(store._client, FakeEmbedder())
+    assert sorted(d["doc_id"] for d in fresh.list_documents()) == ["de-new", "en-new", "en-old", "plain"]
+    assert fresh.get_document("en-old")["metadata"]["year"] == 2001
 
 
-def test_index_is_a_single_object_with_no_per_doc_objects(store):
+def test_index_is_a_manifest_plus_segments_with_no_per_doc_objects(store):
     _corpus(store)
-    assert set(store._client.objects[store._bucket]) == {INDEX_OBJ}
+    keys = set(store._client.objects[store._bucket])
+    assert INDEX_OBJ in keys
+    assert all(k == INDEX_OBJ or (k.startswith("segments/default/") and k.endswith(".seg")) for k in keys)
 
 
 # -- migration from older layouts ---------------------------------------------------
