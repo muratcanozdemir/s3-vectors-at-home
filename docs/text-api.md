@@ -25,6 +25,17 @@ curl -sf localhost:8000/indexes | jq -e '.indexes | index("papers")'
 
 Index names are 1–63 characters of `a-z`, `0-9` and `-`, and can't start or end with `-`. `DELETE /indexes/{name}` deletes an index and all its documents; `default` can't be deleted.
 
+**Approximate search.** Indexes search exactly unless created with `"search": "approximate"`, which searches an HNSW graph instead. With 100,000 vectors, that's about 0.2 ms a search instead of about 8 ms, and it finds the true top 10 nearly every time. The choice is fixed when the index is created, and the `default` index is always exact. See [Operations](operations.md#approximate-search) for when it's worth it and what it costs.
+
+```bash
+curl -sf -X POST localhost:8000/indexes -H 'content-type: application/json' \
+  -d '{"name": "big-papers", "search": "approximate", "ef_search": 100}'
+curl -sf localhost:8000/indexes/big-papers/status | jq -e '.search == "approximate"'
+curl -sf -X DELETE localhost:8000/indexes/big-papers
+```
+
+The tuning parameters are optional, and apply only to approximate indexes: `m`, the graph links per vector (4–128, default 32); `ef_construction`, the candidate list while building (8–1,024, default 64); and `ef_search`, the candidate list while searching (8–4,096, default 64). Raising them improves recall, at the cost of speed and memory. A search on an approximate index can pass `"exact": true` to compare against every vector, for example to measure recall.
+
 ## Adding documents
 
 One document; adding an existing `doc_id` replaces it:
@@ -83,7 +94,7 @@ curl -sf -X POST localhost:8000/indexes/papers/search -H 'content-type: applicat
 - `matches` lists doc_ids, closest first. `results` has the same order, adding `score` (cosine similarity, −1 to 1, higher is closer) and the metadata, and with `"passages": true` the best-matching passage (see [Long documents](#long-documents)).
 - `top_k` defaults to 5 and can be 1–1000. Fewer results come back if the index has fewer documents.
 
-Add a `filter` to search only documents whose metadata matches. Results stay exact: you get the true top-k among the matching documents.
+Add a `filter` to search only documents whose metadata matches. On an exact index, results stay exact: you get the true top-k among the matching documents.
 
 ```bash
 curl -sf -X POST localhost:8000/indexes/papers/search -H 'content-type: application/json' \
@@ -152,12 +163,13 @@ curl -sf -X POST localhost:8000/indexes/papers/compact | jq -e '.segments == 1'
 ```
 
 ```json
-{"status": "ok", "index": "papers", "document_count": 3, "vector_count": 3, "segments": 3, "storage_bytes": 6771, "embedding_model": "all-MiniLM-L6-v2",
+{"status": "ok", "index": "papers", "document_count": 3, "vector_count": 3, "search": "exact", "graph_ready": false,
+ "segments": 3, "storage_bytes": 6771, "embedding_model": "all-MiniLM-L6-v2",
  "cache": {"indexes": 2, "bytes": 11623, "max_bytes": null, "evictions": 0}}
 {"status": "ok", "index": "papers", "document_count": 3, "segments": 1, "storage_bytes": 5008}
 ```
 
-`cache` is this worker process's memory for loaded indexes, all of them; see [Operations](operations.md#memory).
+`search` is `exact` or `approximate`. `graph_ready` says whether an approximate index's graph is built; until it is, its searches are exact. `cache` is this worker process's memory for loaded indexes, all of them; see [Operations](operations.md#memory).
 
 Each write adds a small segment (three here: one upload, one bulk upload, one delete). Compaction normally runs by itself in the background, once there are enough segments to be worth merging. Calling it merges everything into one segment and reclaims the space held by overwritten and deleted documents. See [Operations](operations.md#compaction).
 

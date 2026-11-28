@@ -23,6 +23,9 @@ Everything is set with environment variables. The same variables apply to the se
 | `S3VAH_CACHE_MB` | no limit | memory for loaded indexes, per worker process, in MiB. Past it, the least recently used indexes are dropped and reloaded when next used. See [Operations](operations.md#memory). |
 | `S3VAH_CHUNK_OVERLAP` | `32` | tokens shared by consecutive chunks of a long text in the text API; `off` embeds only the first 256 tokens, as earlier versions did. See [Long documents](text-api.md#long-documents). |
 | `S3VAH_S3VECTORS_API` | `true` | `false` removes the [S3 Vectors API](s3-vectors.md) routes |
+| `S3VAH_S3VECTORS_SEARCH` | `exact` | how new S3 Vectors indexes are searched: `exact` or `approximate`. Existing indexes keep the mode they were created with. See [Operations](operations.md#approximate-search). |
+| `S3VAH_GRAPH_BUILD_THREADS` | half the cores | threads one approximate index's graph build may use |
+| `S3VAH_GRAPH_BUILD` | `background` | `off`: never build graphs, so approximate indexes are searched exactly. The CLI defaults to `off`, since a run ends before a graph would be ready. |
 | `S3VAH_REGION` | `us-east-1` | region shown in S3 Vectors ARNs |
 | `S3VAH_ACCOUNT_ID` | `000000000000` | account shown in S3 Vectors ARNs |
 

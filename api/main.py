@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -77,10 +77,17 @@ class SearchRequest(BaseModel):
         None, description="Metadata filter, e.g. {\"lang\": \"en\", \"year\": {\"$gte\": 2020}}"
     )
     passages: bool = Field(False, description="Add each match's best-matching passage and its character span")
+    exact: bool = Field(False, description="On an approximate index, compare against every vector instead")
 
 
 class IndexCreate(BaseModel):
     name: str
+    search: Literal["exact", "approximate"] = Field(
+        "exact", description="exact (default): every search is exact; approximate: an HNSW graph, much faster on large indexes"
+    )
+    m: int | None = Field(None, description="approximate only: HNSW links per vector (4-128, default 32)")
+    ef_construction: int | None = Field(None, description="approximate only: build-time candidate list (8-1024, default 64)")
+    ef_search: int | None = Field(None, description="approximate only: search-time candidate list (8-4096, default 64)")
 
 
 # -- documents: the same routes at "/" (default index) and "/indexes/{index}"
@@ -132,7 +139,7 @@ def _document_routes(router: APIRouter, index_dep):
     @router.post("/search")
     def search(req: SearchRequest, index: str = from_route):
         results = get_store().search_with_scores(
-            req.query, req.top_k, index=index, filter=req.filter, passages=req.passages
+            req.query, req.top_k, index=index, filter=req.filter, passages=req.passages, exact=req.exact
         )
         # `matches` (bare doc_ids) is kept as-is for existing clients;
         # `results` adds score and metadata per match.
@@ -147,6 +154,8 @@ def _document_routes(router: APIRouter, index_dep):
             "index": index,
             "document_count": stats["documents"],
             "vector_count": stats["vectors"],
+            "search": stats["search"],
+            "graph_ready": stats["graph_ready"],
             "segments": stats["segments"],
             "storage_bytes": stats["bytes"],
             "embedding_model": store.embedding_model_name(),
@@ -184,7 +193,11 @@ def list_indexes():
 
 @app.post("/indexes", status_code=201)
 def create_index(payload: IndexCreate):
-    get_store().create_index(payload.name)
+    params = {"m": payload.m, "ef_construction": payload.ef_construction, "ef_search": payload.ef_search}
+    if payload.search == "exact" and any(v is not None for v in params.values()):
+        raise HTTPException(status_code=400, detail="m, ef_construction and ef_search apply to approximate search only")
+    search = {"mode": payload.search, **params} if payload.search == "approximate" else None
+    get_store().create_index(payload.name, search=search)
     return {"status": "created", "index": payload.name}
 
 

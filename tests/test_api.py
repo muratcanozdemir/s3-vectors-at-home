@@ -143,3 +143,28 @@ def test_a_fact_past_the_model_window_is_found_with_its_passage():
         assert long_text[hit["span"][0]: hit["span"][1]] == hit["passage"]
     finally:
         assert client.delete(f"/indexes/{name}").status_code == 200
+
+
+def test_approximate_indexes_over_http():
+    import uuid
+
+    name = f"api-{uuid.uuid4().hex[:8]}"
+    assert client.post("/indexes", json={"name": name, "search": "approximate", "ef_search": 80}).status_code == 201
+    try:
+        base = f"/indexes/{name}"
+        client.post(f"{base}/upload/bulk", json={"docs": [
+            {"doc_id": "cat", "text": "a cat sat on the mat", "metadata": {"kind": "pet"}},
+            {"doc_id": "rocket", "text": "rocket engine thrust", "metadata": {"kind": "space"}},
+        ]}).raise_for_status()
+        status = client.get(f"{base}/status").json()
+        assert status["search"] == "approximate"
+        assert status["graph_ready"] is False  # two documents: too few for a graph, so searches are exact
+        for exact in (False, True):
+            r = client.post(f"{base}/search", json={"query": "kitten", "top_k": 1, "exact": exact, "filter": {"kind": "pet"}})
+            assert r.json()["matches"] == ["cat"]
+    finally:
+        assert client.delete(f"/indexes/{name}").status_code == 200
+    assert client.post("/indexes", json={"name": f"{name}-x", "search": "fuzzy"}).status_code == 422
+    assert client.post("/indexes", json={"name": f"{name}-x", "ef_search": 80}).status_code == 400
+    assert client.post("/indexes", json={"name": f"{name}-x", "search": "approximate", "m": 1}).status_code == 400
+    assert client.get(f"/indexes/{name}-x/status").status_code == 404

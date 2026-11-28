@@ -82,3 +82,18 @@ def test_cli_named_index_metadata_and_filter():
         ["uv", "run", "s3-vectors-cli", "list", "--index", name], capture_output=True, text=True, check=False
     )
     assert result.returncode == 1 and "not found" in result.stderr
+
+
+def test_cli_approximate_index():
+    name = f"cli-{uuid.uuid4().hex[:8]}"
+    run_cli(["indexes", "create", name, "--approximate", "--ef-search", "100"])
+    try:
+        run_cli(["upload", "--index", name, "--doc-id", "a", "--text", "cats and dogs"])
+        assert run_cli(["search", "--index", name, "--query", "kittens", "--exact"]) == "Matches: ['a']"
+        # The CLI never builds graphs (S3VAH_GRAPH_BUILD=off): its searches are exact.
+        assert "Search: approximate (graph building; searching exactly meanwhile)" in run_cli(["status", "--index", name])
+    finally:
+        run_cli(["indexes", "delete", name])
+    result = subprocess.run(["uv", "run", "s3-vectors-cli", "indexes", "create", f"{name}-x", "--m", "8"],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 1 and "need --approximate" in result.stderr

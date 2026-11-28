@@ -7,7 +7,7 @@ A self-hosted vector store: **MinIO + FAISS + FastAPI**. One server, two APIs:
 - **A text API.** Send text, search by meaning. Embeddings are built in (`all-MiniLM-L6-v2` on ONNX Runtime).
 - **The [Amazon S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html) API.** Point `boto3` or any AWS SDK at it and bring your own vectors.
 
-Search is exact, metadata filters included. Any number of processes can safely write to the same bucket at once. And a write costs the same whether an index holds 50 documents or 50,000.
+Search is exact by default, metadata filters included, and an index can opt into approximate (HNSW) search when it's big enough to need it. Any number of processes can safely write to the same bucket at once. And a write costs the same whether an index holds 50 documents or 50,000.
 
 ## Quick start
 

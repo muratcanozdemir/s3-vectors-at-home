@@ -26,7 +26,9 @@ Both APIs filter on metadata with the same MongoDB-style language that Amazon S3
 - **A missing field** matches only `$ne`, `$nin` and `{"$exists": false}`.
 - **Unknown operators are rejected** with a 400 (`ValidationException` in S3 Vectors), never silently ignored. That includes `$regex`, `$not`, `$nor`, and nested objects as values.
 
-Filtered search is **exact**: the results are the true top-k among the documents that match, however few match. A filter doesn't make results approximate or short.
+Filtered search is **exact** on an exact index (the default): the results are the true top-k among the documents that match, however few match. A filter doesn't make results approximate or short. On an [approximate index](operations.md#approximate-search), a filter that matches few documents is still searched exactly; a broad one goes through the graph.
+
+**Speed.** Each field a filter uses is indexed the first time a filter mentions it: which documents hold each value, and the values in sorted order for ranges and prefixes. Fields nobody filters on cost nothing. With 100,000 documents, a filter matching 1% of them takes under 1 ms, one matching 25% about 5–8 ms, and one matching 60% about 11–15 ms. Before, every filtered search checked every document, which took about 110 ms.
 
 ## Examples
 

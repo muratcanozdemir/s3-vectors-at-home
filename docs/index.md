@@ -7,7 +7,7 @@ A self-hosted vector store: **MinIO + FAISS + FastAPI**. One server, two APIs:
 - **A text API.** Send text, search by meaning. Embeddings are built in (`all-MiniLM-L6-v2` on ONNX Runtime), so you never handle vectors.
 - **The Amazon S3 Vectors API.** Point `boto3` or any AWS SDK at it and bring your own vectors.
 
-Both store everything in a MinIO bucket, are safe with many processes writing at once, and give exact (not approximate) search results, metadata filters included.
+Both store everything in a MinIO bucket, are safe with many processes writing at once, and give exact search results by default, metadata filters included. An index can opt into approximate (HNSW) search, which is much faster on large indexes.
 
 ## Five-minute tour
 
