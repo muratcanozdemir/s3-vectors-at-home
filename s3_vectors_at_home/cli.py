@@ -5,12 +5,16 @@ import sys
 
 from minio.error import S3Error
 
+from vectorstore import backup
+from vectorstore.backup import BackupError
 from vectorstore.core import (
+    BUCKET,
     DEFAULT_INDEX,
     IndexAlreadyExistsError,
     IndexCorruptError,
     IndexNotFoundError,
     IndexWriteConflictError,
+    client_from_env,
     get_store,
 )
 
@@ -115,6 +119,19 @@ def cmd_indexes_delete(args):
     print(f"Deleted index {args.name}")
 
 
+def cmd_backup(args):
+    catalog = backup.backup(client_from_env(), BUCKET, args.dir)
+    total = sum(f["bytes"] for f in catalog["files"].values())
+    print(f"Backed up {len(catalog['indexes'])} index(es), {total:,} bytes, to {args.dir}")
+
+
+def cmd_restore(args):
+    names = backup.restore(
+        client_from_env(), BUCKET, args.dir, only=args.index, replace=args.replace, dry_run=args.dry_run
+    )
+    print(f"{'Would restore' if args.dry_run else 'Restored'} {len(names)} index(es)")
+
+
 def main():
     # A CLI run is over in seconds: building an approximate index's graph
     # would only make it wait at exit. Its searches are exact instead.
@@ -177,10 +194,23 @@ def main():
     cp.add_argument("name", nargs="?", default=DEFAULT_INDEX)
     cp.set_defaults(func=cmd_indexes_compact)
 
+    bk = subp.add_parser("backup", help="Back up every index (text API and S3 Vectors) to a new local directory")
+    bk.add_argument("dir", help="directory to create (or an empty one)")
+    bk.set_defaults(func=cmd_backup)
+    rs = subp.add_parser("restore", help="Restore indexes from a backup directory")
+    rs.add_argument("dir", help="a directory made by 'backup'")
+    rs.add_argument("--index", action="append", metavar="NAME",
+                    help="restore only this index (repeatable); S3 Vectors indexes are BUCKET/INDEX")
+    rs.add_argument("--replace", action="store_true", help="overwrite indexes that exist already")
+    rs.add_argument("--dry-run", action="store_true", help="check the backup and report what would be restored")
+    rs.set_defaults(func=cmd_restore)
+
     args = ap.parse_args()
     try:
         args.func(args)
-    except (ValueError, IndexNotFoundError, IndexAlreadyExistsError, IndexWriteConflictError, IndexCorruptError) as e:
+    except (
+        ValueError, IndexNotFoundError, IndexAlreadyExistsError, IndexWriteConflictError, IndexCorruptError, BackupError
+    ) as e:
         msg = {
             IndexNotFoundError: f"index {e.args[0]!r} not found",
             IndexAlreadyExistsError: f"index {e.args[0]!r} already exists",
