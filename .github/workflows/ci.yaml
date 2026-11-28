@@ -94,17 +94,32 @@ jobs:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     needs: build
+    # PyPI Trusted Publishing (OIDC): PyPI trusts this workflow + environment,
+    # so there's no long-lived API token to store or leak. One-time setup on
+    # pypi.org: a (pending) publisher for owner muratcanozdemir, repository
+    # s3-vectors-at-home, workflow ci.yaml, environment pypi.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/s3-vectors-at-home/
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
+      - name: Release tag must match the package version
+        # PyPI versions can't be reused, so a mistyped tag must not publish.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(ls dist/*.whl | sed -E 's/.*-([^-]+)-py3-none-any\.whl/\1/')
+          echo "tag=$TAG wheel=$version"
+          test "${TAG#v}" = "$version"
       - uses: astral-sh/setup-uv@v7
       - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: uvx twine upload dist/*
+        run: uv publish --trusted-publishing always dist/*
 
   publish-image:
     if: github.event_name == 'release'
