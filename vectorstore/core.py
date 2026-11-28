@@ -7,9 +7,11 @@ import os
 import random
 import re
 import struct
+import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
@@ -18,7 +20,7 @@ import numpy as np
 from minio.error import S3Error
 
 from minio import Minio
-from vectorstore.embedding import MODEL_NAME, OnnxEmbedder
+from vectorstore.embedding import DEFAULT_CHUNK_OVERLAP, MODEL_NAME, OnnxEmbedder
 from vectorstore.filters import matches, validate_filter, validate_metadata
 
 logger = logging.getLogger(__name__)
@@ -238,24 +240,38 @@ def _segment_dir(name: str, incarnation: str | None = None) -> str:
 
 
 # -- segments -----------------------------------------------------------------
-# A record is (seq, doc_id, text, metadata, vector); text is None for a
-# tombstone (then metadata and vector are None too). seq is None in a segment
-# a writer uploads: it is the seq the manifest gives that segment. `vector`
-# is a (block, row) reference into a 2-D float32 array, so a segment's
-# vectors stay one block and are gathered with one fancy-index per block,
-# not stacked row by row (which made loading a 50k-doc index 2x slower).
+# A record is (seq, doc_id, text, metadata, vector, spans); text is None for
+# a tombstone (then metadata, vector and spans are None too). seq is None in
+# a segment a writer uploads: it is the seq the manifest gives that segment.
+# `vector` is a (block, row) reference into a 2-D float32 array, so a
+# segment's vectors stay one block and are gathered with one fancy-index per
+# block, not stacked row by row (which made loading a 50k-doc index 2x
+# slower). `spans` is None for a document with one vector; a long text split
+# into chunks has one vector per chunk, rows row..row+len(spans)-1, and
+# spans [[start, end], ...] gives the characters of the text each covers.
 #
 # Blob: SEGMENT_MAGIC | u64 big-endian length of header JSON |
-#   header JSON {"dim", "records": [[seq, doc_id, text, metadata], ...]} |
+#   header JSON {"dim", "records": [[seq, doc_id, text, metadata(, spans)], ...]} |
 #   float32 little-endian vectors of the upsert records, in record order.
+# A record without a fifth element has one vector, so segments written
+# before chunking existed read unchanged.
+
+
+def _vector_count(rec: tuple) -> int:
+    return len(rec[5]) if rec[5] else 1
 
 
 def _encode_segment(dim: int, records: list[tuple]) -> bytes:
     header = json.dumps(
-        {"dim": dim, "records": [[seq, d, t, m] for seq, d, t, m, _ in records]}, separators=(",", ":")
+        {"dim": dim, "records": [[seq, d, t, m, sp] if sp else [seq, d, t, m] for seq, d, t, m, _, sp in records]},
+        separators=(",", ":"),
     ).encode()
-    refs = [v for _, _, t, _, v in records if t is not None]
-    body = _gather(refs, dim).astype("<f4", copy=False).tobytes() if refs else b""
+    upserts = [r for r in records if r[2] is not None]
+    body = (
+        _gather([r[4] for r in upserts], dim, [_vector_count(r) for r in upserts]).astype("<f4", copy=False).tobytes()
+        if upserts
+        else b""
+    )
     return b"".join((SEGMENT_MAGIC, struct.pack(">Q", len(header)), header, body))
 
 
@@ -292,32 +308,43 @@ def _decode_segment(blob: bytes, key: str, dim: int, default_seq: int) -> list[t
     header = json.loads(blob[pos: pos + header_len])
     if header["dim"] != dim:
         raise ValueError(f"{key} has dimension {header['dim']}, the index {dim}")
-    n_vectors = sum(1 for r in header["records"] if r[2] is not None)
+    n_vectors = sum((len(r[4]) if len(r) > 4 else 1) for r in header["records"] if r[2] is not None)
     vectors = np.frombuffer(blob, dtype="<f4", offset=pos + header_len)
     if vectors.size != n_vectors * dim:
         raise ValueError(f"{key} is corrupt: {vectors.size} floats for {n_vectors} vectors of {dim}")
     block = vectors.reshape(n_vectors, dim).astype(np.float32, copy=False)
     out, i = [], 0
-    for seq, doc_id, text, metadata in header["records"]:
+    for seq, doc_id, text, metadata, *rest in header["records"]:
+        seq = seq if seq is not None else default_seq
         if text is None:
-            out.append((seq if seq is not None else default_seq, doc_id, None, None, None))
+            out.append((seq, doc_id, None, None, None, None))
         else:
-            out.append((seq if seq is not None else default_seq, doc_id, text, metadata, (block, i)))
-            i += 1
+            spans = rest[0] if rest else None
+            out.append((seq, doc_id, text, metadata, (block, i), spans))
+            i += len(spans) if spans else 1
     return out
 
 
-def _gather(refs: list[tuple[np.ndarray, int]], dim: int) -> np.ndarray:
-    """Stack (block, row) vector references into one (len(refs), dim) array."""
+def _gather(refs: list[tuple[np.ndarray, int]], dim: int, counts: list[int] | None = None) -> np.ndarray:
+    """Stack (block, row) vector references into one (len(refs), dim) array.
+
+    With `counts`, reference i stands for counts[i] consecutive rows from
+    `row` on (a chunked document's vectors), and the result has sum(counts) rows.
+    """
     blocks: dict[int, tuple[int, np.ndarray]] = {}
     which = np.fromiter((blocks.setdefault(id(b), (len(blocks), b))[0] for b, _ in refs), np.int64, len(refs))
     rows = np.fromiter((r for _, r in refs), np.int64, len(refs))
+    if counts is not None and any(c != 1 for c in counts):
+        c = np.asarray(counts, dtype=np.int64)
+        firsts = np.cumsum(c) - c  # where each reference's rows start in the output
+        rows = np.repeat(rows - firsts, c) + np.arange(int(c.sum()))
+        which = np.repeat(which, c)
     if len(blocks) == 1:
         (_, block), = blocks.values()
         if len(rows) == len(block) and np.array_equal(rows, np.arange(len(block))):
             return np.ascontiguousarray(block, dtype=np.float32)  # the whole block, in order
         return np.ascontiguousarray(block[rows], dtype=np.float32)
-    out = np.empty((len(refs), dim), dtype=np.float32)
+    out = np.empty((len(rows), dim), dtype=np.float32)
     for i, block in blocks.values():
         mask = which == i
         out[mask] = block[rows[mask]]
@@ -359,14 +386,24 @@ def _plan_merge(segments: list[dict]) -> tuple[int, int] | None:
     return (i, n) if n - i >= (2 if forced else MIN_MERGE) else None
 
 
+def chunk_label(doc_id: str, chunk: int) -> int:
+    """FAISS id of a document's vector for chunk `chunk`. Chunk 0's is the
+    document's own id, so unchunked documents need no extra bookkeeping."""
+    return object_key_id(doc_id) if chunk == 0 else object_key_id(f"{doc_id}\x00{chunk}")
+
+
 class _IndexState:
     """One index in memory: the FAISS index plus every document's fields.
 
-    `docs` maps FAISS id -> {"doc_id", "text", "metadata"}. `by_id` is the
-    reverse lookup, derived from `docs`.
+    `docs` maps a document's id (`object_key_id`) -> {"doc_id", "text",
+    "metadata"}, plus "spans" and "labels" for a document split into
+    chunks. `by_id` is the reverse lookup, derived from `docs`. FAISS holds
+    one vector per chunk: chunk 0 under the document's id, chunk i under
+    `chunk_label(doc_id, i)`; `owner` maps each of the latter to
+    (document id, i).
     """
 
-    __slots__ = ("by_id", "dim", "docs", "faiss", "metric", "raw")
+    __slots__ = ("_vector_bytes", "by_id", "dim", "docs", "faiss", "metric", "nbytes", "owner", "raw")
 
     def __init__(self, dim: int, metric: str = "cosine", raw: bool = False):
         # FAISS always measures squared L2. For "cosine" the vectors it holds
@@ -379,6 +416,10 @@ class _IndexState:
         self.faiss = faiss.IndexIDMap2(faiss.IndexFlatL2(dim))
         self.docs: dict[int, dict] = {}
         self.by_id: dict[str, int] = {}
+        self.owner: dict[int, tuple[int, int]] = {}
+        # Estimated memory held, kept up to date by `apply` (see `_batch_bytes`).
+        self.nbytes = 0
+        self._vector_bytes = int(4.4 * dim) + 56 + (4 * dim + 112 if raw else 0)
 
     def apply(self, latest: dict[str, tuple]):
         """Make each doc_id in `latest` ({doc_id: record}) match its record."""
@@ -386,27 +427,186 @@ class _IndexState:
             return
         keys = {doc_id: object_key_id(doc_id) for doc_id in latest}
         if self.docs:
-            gone = np.array([k for k in keys.values() if k in self.docs], dtype="int64")
-            if gone.size:
-                self.faiss.remove_ids(gone)
-            for k in gone.tolist():
-                del self.by_id[self.docs.pop(k)["doc_id"]]
+            gone = []
+            for k in keys.values():
+                doc = self.docs.pop(k, None)
+                if doc is None:
+                    continue
+                del self.by_id[doc["doc_id"]]
+                self.nbytes -= _batch_bytes(
+                    self._vector_bytes,
+                    [(None, doc["doc_id"], doc["text"], doc["metadata"], None, doc.get("spans"))],
+                    1 + len(doc.get("labels", ())),
+                )
+                gone.append(k)
+                for label in doc.get("labels", ()):
+                    del self.owner[label]
+                    gone.append(label)
+            if gone:
+                self.faiss.remove_ids(np.array(gone, dtype="int64"))
         upserts = [rec for rec in latest.values() if rec[2] is not None]
-        if upserts:
-            vectors = _gather([rec[4] for rec in upserts], self.dim)
-            searchable = vectors
-            if self.raw and self.metric == "cosine":
-                searchable = unit_rows(vectors)
-            self.faiss.add_with_ids(
-                np.ascontiguousarray(searchable, dtype=np.float32),
-                np.array([keys[rec[1]] for rec in upserts], dtype="int64"),
-            )
-            for i, (_, doc_id, text, metadata, _) in enumerate(upserts):
-                doc = {"doc_id": doc_id, "text": text, "metadata": metadata}
-                if self.raw:
-                    doc["vector"] = vectors[i].copy()
-                self.docs[keys[doc_id]] = doc
-                self.by_id[doc_id] = keys[doc_id]
+        if not upserts:
+            return
+        chunked = any(rec[5] for rec in upserts)
+        counts = [len(rec[5]) if rec[5] else 1 for rec in upserts] if chunked else None
+        vectors = _gather([rec[4] for rec in upserts], self.dim, counts)
+        searchable = vectors
+        if self.raw and self.metric == "cosine":
+            searchable = unit_rows(vectors)
+        docs, by_id, raw = self.docs, self.by_id, self.raw
+        # Runs once per document on every load, so the common case (no
+        # chunks) is one tight loop, and the size estimate is batch sums.
+        labels, row = [], 0
+        for rec in upserts:
+            doc_id = rec[1]
+            key = keys[doc_id]
+            doc = {"doc_id": doc_id, "text": rec[2], "metadata": rec[3]}
+            if raw:
+                doc["vector"] = vectors[row].copy()
+            labels.append(key)
+            n = len(rec[5]) if chunked and rec[5] else 1
+            if n > 1:
+                doc["spans"] = rec[5]
+                doc["labels"] = [chunk_label(doc_id, i) for i in range(1, n)]
+                for i, label in enumerate(doc["labels"], 1):
+                    self.owner[label] = (key, i)
+                labels.extend(doc["labels"])
+            docs[key] = doc
+            by_id[doc_id] = key
+            row += n
+        self.nbytes += _batch_bytes(self._vector_bytes, upserts, row)
+        self.faiss.add_with_ids(np.ascontiguousarray(searchable, dtype=np.float32), np.array(labels, dtype="int64"))
+
+    def search(self, q: np.ndarray, top_k: int, filter: dict | None) -> list[tuple[float, dict, int]]:
+        """[(squared L2 distance, doc, chunk)] of the top_k closest documents
+        matching `filter`, closest first. A chunked document counts once, at
+        its closest chunk. Exact: FAISS is asked for more vectors until
+        top_k distinct documents are found or every candidate has been seen."""
+        params = None
+        if filter:
+            allowed = [k for k, d in self.docs.items() if matches(filter, d["metadata"])]
+            if self.owner:
+                allowed += [label for k in allowed for label in self.docs[k].get("labels", ())]
+            if not allowed:
+                return []
+            candidates = len(allowed)
+            params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(np.array(allowed, dtype="int64")))
+        else:
+            candidates = self.faiss.ntotal
+            if candidates == 0:
+                return []
+        k = min(top_k * 2 if self.owner else top_k, candidates)
+        while True:
+            distances, ids = self.faiss.search(q, k, params=params)
+            hits, seen = [], set()
+            # FAISS pads short result sets with id -1: skip those.
+            for d, label in zip(distances[0].tolist(), ids[0].tolist()):
+                if label == -1:
+                    continue
+                key, chunk = self.owner.get(label, (label, 0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append((d, self.docs[key], chunk))
+                if len(hits) == top_k:
+                    return hits
+            if k >= candidates:
+                return hits
+            k = min(k * 2, candidates)
+
+
+class IndexCache:
+    """Which loaded indexes a process keeps in memory, under one byte budget.
+
+    Shared by every VectorStore of a process (the text API's and one per S3
+    Vectors bucket), so the budget is per process, as memory is. Each entry
+    is a (store, index) whose in-memory state was estimated at `nbytes`.
+    When the total exceeds `max_bytes`, the least recently used indexes are
+    dropped from their store's cache; they're reloaded from the object store
+    the next time they're used. The index being used right now is never
+    dropped, so one index bigger than the budget still works (alone).
+    `max_bytes=None` keeps everything, as before there was a budget.
+
+    All changes to the stores' cache dicts are made here, under this
+    object's lock, so what it counts is exactly what the stores hold.
+    Evicting pops another store's entry without that store's lock: a thread
+    using the index keeps its reference and finishes normally, and an entry
+    is only ever a correct snapshot for its manifest ETag, so a missing one
+    just means a reload. (Taking the other store's lock here could deadlock
+    two stores evicting each other.)
+    """
+
+    def __init__(self, max_bytes: int | None = None):
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("the cache budget must not be negative")
+        self.max_bytes = max_bytes
+        self._lock = threading.Lock()
+        # (id(store), name) -> (store, name, bytes), least recently used first.
+        self._entries: OrderedDict[tuple[int, str], tuple[VectorStore, str, int]] = OrderedDict()
+        self._total = 0
+        self.evictions = 0
+
+    def put(self, store: "VectorStore", name: str, cached: "_Cached") -> None:
+        """Make `cached` store's entry for `name`, as the most recently used;
+        then evict others until the total fits the budget."""
+        key = (id(store), name)
+        with self._lock:
+            self._discard(key)
+            store._cache[name] = cached
+            self._entries[key] = (store, name, cached.state.nbytes)
+            self._total += cached.state.nbytes
+            if self.max_bytes is None:
+                return
+            while self._total > self.max_bytes and len(self._entries) > 1:
+                vkey, (vstore, vname, _) = next(iter(self._entries.items()))
+                self._discard(vkey)
+                vstore._cache.pop(vname, None)
+                self.evictions += 1
+                logger.debug("dropped index %r from memory to stay within %s bytes", vname, self.max_bytes)
+
+    def drop(self, store: "VectorStore", name: str) -> None:
+        with self._lock:
+            self._discard((id(store), name))
+            store._cache.pop(name, None)
+
+    def touch(self, store: "VectorStore", name: str) -> None:
+        """Mark store's index `name` as just used."""
+        with self._lock:
+            key = (id(store), name)
+            if key in self._entries:
+                self._entries.move_to_end(key)
+
+    def _discard(self, key) -> None:
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self._total -= old[2]
+
+    def stats(self) -> dict:
+        """{"indexes", "bytes", "max_bytes", "evictions"} for this process."""
+        with self._lock:
+            return {
+                "indexes": len(self._entries),
+                "bytes": self._total,
+                "max_bytes": self.max_bytes,
+                "evictions": self.evictions,
+            }
+
+
+def _batch_bytes(vector_bytes: int, records: list[tuple], n_vectors: int) -> int:
+    """Rough memory a set of upsert records takes once applied, with
+    n_vectors vectors between them: each vector's float32 row (FAISS grows
+    its arrays geometrically, so ~10% over) and FAISS id-map entry, and the
+    raw copy if kept (all in `vector_bytes`), plus the Python objects for
+    text, metadata and bookkeeping. An estimate, to compare indexes against
+    the cache budget: within ~5% of measured RSS for 384- and 1024-dimension
+    indexes. Computed as sums over the batch, since it runs on every load."""
+    getsizeof = sys.getsizeof
+    size = n_vectors * vector_bytes + 200 * len(records)
+    size += sum(map(getsizeof, (r[2] for r in records))) + sum(map(getsizeof, (r[1] for r in records)))
+    size += 110 * sum(map(len, (r[3] for r in records)))
+    size += sum(56 + 40 * len(v) for r in records if r[3] for v in r[3].values() if type(v) is list)
+    size += 150 * sum(len(r[5]) for r in records if r[5])  # chunk labels, owner entries and spans
+    return size
 
 
 class _Cached:
@@ -511,6 +711,8 @@ class VectorStore:
         io_pool: ThreadPoolExecutor | None = None,
         compactor: ThreadPoolExecutor | None = None,
         verify_conditional_writes: bool = True,
+        chunk_overlap: int | None = DEFAULT_CHUNK_OVERLAP,
+        cache: IndexCache | None = None,
     ):
         """`prefix`, `default_index`, `index_name_re` and `raw_vectors` let one
         bucket hold several independent namespaces of indexes (the S3
@@ -523,6 +725,13 @@ class VectorStore:
         namespaces must not mean many threads each), and
         `verify_conditional_writes=False` skips the startup probe for a store
         whose client another store has already checked.
+
+        `chunk_overlap` is how many tokens consecutive chunks of a long text
+        share; None turns chunking off (long texts are embedded truncated).
+
+        `cache` is the process's memory budget for loaded indexes, shared
+        between stores (see IndexCache); by default the store has its own,
+        unlimited one.
         """
         if compaction not in ("background", "inline", "off"):
             raise ValueError("compaction must be 'background', 'inline' or 'off'")
@@ -530,12 +739,14 @@ class VectorStore:
         self._default = default_index
         self._name_re = index_name_re
         self._raw = raw_vectors
+        self._chunk_overlap = chunk_overlap
         self._client = client
         self._embedder = embedder
         self._bucket = bucket
         self._lock = threading.Lock()
         self._io = io_pool or ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="vectorstore-io")
         self._cache: dict[str, _Cached] = {}
+        self._cache_budget = cache or IndexCache()
         self._dim: int | None = None
         # Identifies this store's writes in manifests; see `_commit`.
         self._writer_id = uuid.uuid4().hex[:16]
@@ -674,10 +885,31 @@ class VectorStore:
     def _embed(self, text: str) -> np.ndarray:
         return self._embed_many([text])[0]
 
+    def _chunk_spans(self, text: str) -> list[tuple[int, int]]:
+        """Spans of `text` to embed one vector each (see OnnxEmbedder.chunk_spans)."""
+        split = getattr(self._embedder, "chunk_spans", None)
+        if self._chunk_overlap is None or split is None:
+            return [(0, len(text))]
+        return split(text, self._chunk_overlap) or [(0, len(text))]
+
     def _embedding_dim(self) -> int:
         if self._dim is None:
             self._dim = int(self._embed("dimension probe").shape[0])
         return self._dim
+
+    # -- the in-memory cache ----------------------------------------------------
+    # Every change to `self._cache` goes through these, so the process-wide
+    # IndexCache knows what is held and can evict to stay in its budget.
+
+    def _cache_put(self, name: str, cached: _Cached) -> None:
+        self._cache_budget.put(self, name, cached)
+
+    def _cache_drop(self, name: str) -> None:
+        self._cache_budget.drop(self, name)
+
+    def cache_stats(self) -> dict:
+        """Memory held by loaded indexes in this process: see IndexCache.stats."""
+        return self._cache_budget.stats()
 
     # -- reading an index -----------------------------------------------------
 
@@ -723,14 +955,15 @@ class VectorStore:
             if not stale:
                 etag = self._etag(key)
                 if etag is None:
-                    self._cache.pop(name, None)
+                    self._cache_drop(name)
                     return None
                 if cached is not None and cached.etag == etag:
+                    self._cache_budget.touch(self, name)
                     return cached
             stale = False
             got = self._read_manifest(name)
             if got is None:
-                self._cache.pop(name, None)
+                self._cache_drop(name)
                 return None
             manifest, etag = got
             try:
@@ -743,7 +976,7 @@ class VectorStore:
                     raise IndexCorruptError(f"index {name!r} lists segment {e.args[0]!r}, which doesn't exist") from None
                 missing_before = (etag, e.args[0])
                 continue
-            self._cache[name] = fresh
+            self._cache_put(name, fresh)
             return fresh
 
     def _catch_up(self, name: str, cached: _Cached | None, manifest: dict, etag: str) -> _Cached:
@@ -760,7 +993,7 @@ class VectorStore:
             latest = _latest(r for r in newer if r[0] > cached.applied)
             # Fetching can't fail past this point; drop the cache entry while
             # mutating so a failure can't leave a half-applied state cached.
-            self._cache.pop(name, None)
+            self._cache_drop(name)
             state = cached.state
         else:
             with _gc_paused():
@@ -827,7 +1060,7 @@ class VectorStore:
         if not legacy:
             return self._embedding_dim(), []
         dim = next(iter(legacy.values()))[0].shape[0]
-        return dim, [(None, d, text, {}, (vec.reshape(1, -1), 0)) for d, (vec, text) in legacy.items()]
+        return dim, [(None, d, text, {}, (vec.reshape(1, -1), 0), None) for d, (vec, text) in legacy.items()]
 
     def _legacy_docs(self) -> dict[str, tuple[np.ndarray, str]]:
         """{doc_id: (vector, text)} from a v1/v2 bucket; {} if there is none.
@@ -945,9 +1178,9 @@ class VectorStore:
                 # The new manifest is exactly the old one plus our segment, so
                 # the new state is the cached one plus our records. Drop the
                 # entry while mutating in case applying fails half-way.
-                self._cache.pop(name, None)
+                self._cache_drop(name)
                 cached.state.apply(_latest((seq, *r[1:]) for r in records))
-                self._cache[name] = _Cached(new_etag, new, cached.state, seq)
+                self._cache_put(name, _Cached(new_etag, new, cached.state, seq))
                 return True
             raise IndexWriteConflictError(
                 f"index update kept losing to concurrent writers for {time.monotonic() - started:.0f} s "
@@ -1148,7 +1381,7 @@ class VectorStore:
             got = self._read_manifest(name)
             if got is None and not had_v3:
                 raise IndexNotFoundError(name)
-            self._cache.pop(name, None)
+            self._cache_drop(name)
             if got is None:
                 return
             self._delete_object(self._mkey(name))
@@ -1169,13 +1402,15 @@ class VectorStore:
         return self.index_stats(index)
 
     def index_stats(self, index: str = DEFAULT_INDEX) -> dict:
-        """{"documents", "segments", "bytes"} (bytes: all segments, live or not)."""
+        """{"documents", "vectors", "segments", "bytes"} (vectors: one per chunk;
+        bytes: all segments, live or not)."""
         self._check_name(index)
         with self._lock:
             cached = self._ensure(index)
             entries = cached.manifest["segments"]
             return {
                 "documents": len(cached.state.docs),
+                "vectors": cached.state.faiss.ntotal,
                 "segments": len(entries),
                 "bytes": sum(e["bytes"] for e in entries),
             }
@@ -1202,7 +1437,7 @@ class VectorStore:
         vecs = np.vstack([batch[k][0] for k in keys]) if len(dims) == 1 else None
         if vecs is not None and not np.isfinite(vecs).all():
             raise ValueError("vector data must be finite (no NaN or infinity)")
-        records = [(None, k, "", batch[k][1], (vecs, i)) for i, k in enumerate(keys)] if vecs is not None else []
+        records = [(None, k, "", batch[k][1], (vecs, i), None) for i, k in enumerate(keys)] if vecs is not None else []
         ids = [object_key_id(k) for k in keys]
 
         def check(state: _IndexState) -> bool:
@@ -1211,9 +1446,9 @@ class VectorStore:
             if state.metric == "cosine" and not row_norms(vecs).all():
                 raise ValueError("an all-zero vector has no direction; it can't be stored in a cosine index")
             for key, kid in zip(keys, ids):
-                owner = state.docs.get(kid)
-                if owner is not None and owner["doc_id"] != key:
-                    raise ValueError(f"key {key!r} collides with {owner['doc_id']!r}; use another key")
+                clash = _collision(state, key, kid)
+                if clash is not None:
+                    raise ValueError(f"key {key!r} collides with {clash!r}; use another key")
             return True
 
         with self._lock:
@@ -1258,7 +1493,7 @@ class VectorStore:
         if not keys:
             return
         with self._lock:
-            self._commit(index, [(None, k, None, None, None) for k in keys], lambda state: any(k in state.by_id for k in keys))
+            self._commit(index, [(None, k, None, None, None, None) for k in keys], lambda state: any(k in state.by_id for k in keys))
         self._after_write(index)
 
     def query_vectors(self, index: str, vector, top_k: int, filter: dict | None = None) -> tuple[str, list[dict]]:
@@ -1279,28 +1514,12 @@ class VectorStore:
                 if not row_norms(q).all():
                     raise ValueError("an all-zero query vector has no direction for cosine distance")
                 q = unit_rows(q)
-            hits = self._search(state, q, top_k, filter)
+            hits = state.search(q, top_k, filter)
             out = []
-            for d, doc in hits:
+            for d, doc, _ in hits:
                 dist = d / 2.0 if state.metric == "cosine" else float(np.sqrt(max(d, 0.0)))
                 out.append({"key": doc["doc_id"], "distance": dist, "metadata": _copy_metadata(doc["metadata"])})
             return state.metric, out
-
-    @staticmethod
-    def _search(state: "_IndexState", q: np.ndarray, top_k: int, filter: dict | None) -> list[tuple[float, dict]]:
-        """[(squared L2 distance, doc)] of the top_k matches, closest first. Holds no lock itself."""
-        if filter:
-            allowed = np.array([k for k, d in state.docs.items() if matches(filter, d["metadata"])], dtype="int64")
-            if not allowed.size:
-                return []
-            params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
-            distances, ids = state.faiss.search(q, top_k, params=params)
-        else:
-            if state.faiss.ntotal == 0:
-                return []
-            distances, ids = state.faiss.search(q, top_k)
-        # FAISS pads short result sets with id -1: skip those.
-        return [(float(d), state.docs[int(i)]) for d, i in zip(distances[0], ids[0]) if i != -1]
 
     # -- documents ------------------------------------------------------------
 
@@ -1329,17 +1548,23 @@ class VectorStore:
         if not batch:
             return 0
         doc_ids = list(batch)
-        vecs = self._embed_many([batch[d][0] for d in doc_ids])
-        keys = [object_key_id(d) for d in doc_ids]
-        records = [(None, d, batch[d][0], batch[d][1], (vecs, i)) for i, d in enumerate(doc_ids)]
+        spans = {d: self._chunk_spans(batch[d][0]) for d in doc_ids}
+        pieces = [batch[d][0] if len(spans[d]) == 1 else batch[d][0][a:b] for d in doc_ids for a, b in spans[d]]
+        vecs = self._embed_many(pieces)
+        records, row = [], 0
+        for d in doc_ids:
+            chunked = [list(sp) for sp in spans[d]] if len(spans[d]) > 1 else None
+            records.append((None, d, batch[d][0], batch[d][1], (vecs, row), chunked))
+            row += len(spans[d])
+        labels = [(d, chunk_label(d, i)) for d in doc_ids for i in range(len(spans[d]))]
 
         def check(state: _IndexState) -> bool:
             if vecs.shape[1] != state.dim:
                 raise ValueError(f"embedding dimension {vecs.shape[1]} doesn't match index {index!r} ({state.dim})")
-            for doc_id, key in zip(doc_ids, keys):
-                owner = state.docs.get(key)
-                if owner is not None and owner["doc_id"] != doc_id:
-                    raise ValueError(f"doc_id {doc_id!r} collides with {owner['doc_id']!r}; use another doc_id")
+            for doc_id, label in labels:
+                clash = _collision(state, doc_id, label)
+                if clash is not None:
+                    raise ValueError(f"doc_id {doc_id!r} collides with {clash!r}; use another doc_id")
             return True
 
         with self._lock:
@@ -1387,7 +1612,7 @@ class VectorStore:
             return present
 
         with self._lock:
-            self._commit(index, [(None, doc_id, None, None, None)], check)
+            self._commit(index, [(None, doc_id, None, None, None, None)], check)
         self._after_write(index)
         return found
 
@@ -1396,7 +1621,12 @@ class VectorStore:
         return [r["doc_id"] for r in self.search_with_scores(query, top_k, index=index, filter=filter)]
 
     def search_with_scores(
-        self, query: str, top_k: int = 5, index: str = DEFAULT_INDEX, filter: dict | None = None
+        self,
+        query: str,
+        top_k: int = 5,
+        index: str = DEFAULT_INDEX,
+        filter: dict | None = None,
+        passages: bool = False,
     ) -> list[dict]:
         """Top_k matches as [{"doc_id", "score", "metadata"}], closest first.
 
@@ -1404,7 +1634,11 @@ class VectorStore:
         whose metadata matches; the search is still exact, i.e. these are the
         true top_k among the matching documents. `score` is cosine
         similarity (-1..1, higher is closer): vectors are unit-normalised,
-        so it is 1 - d/2 from FAISS's squared L2 distance d.
+        so it is 1 - d/2 from FAISS's squared L2 distance d. A long document
+        is split into chunks, and scores as its closest chunk; with
+        `passages`, each match also has "passage" (that chunk's text, or the
+        whole text of an unchunked document) and "span" ([start, end), its
+        characters in the text).
         """
         if not 1 <= top_k <= MAX_TOP_K:
             raise ValueError(f"top_k must be between 1 and {MAX_TOP_K}")
@@ -1414,10 +1648,15 @@ class VectorStore:
         qv = np.expand_dims(self._embed(query), axis=0)
         with self._lock:
             state = self._ensure(index).state
-            return [
-                {"doc_id": doc["doc_id"], "score": float(1.0 - d / 2.0), "metadata": _copy_metadata(doc["metadata"])}
-                for d, doc in self._search(state, qv, top_k, filter)
-            ]
+            out = []
+            for d, doc, chunk in state.search(qv, top_k, filter):
+                hit = {"doc_id": doc["doc_id"], "score": float(1.0 - d / 2.0), "metadata": _copy_metadata(doc["metadata"])}
+                if passages:
+                    start, end = doc["spans"][chunk] if "spans" in doc else (0, len(doc["text"]))
+                    hit["passage"] = doc["text"][start:end]
+                    hit["span"] = [start, end]
+                out.append(hit)
+            return out
 
     def count_documents(self, index: str = DEFAULT_INDEX) -> int:
         self._check_name(index)
@@ -1468,7 +1707,7 @@ def _split_parts(records: list[tuple], dim: int) -> list[bytes]:
     """Encode records as segments of at most ~MAX_SEGMENT_BYTES each."""
     parts, current, size = [], [], 0
     for rec in records:
-        rec_size = len(rec[1]) + len(rec[2] or "") + len(json.dumps(rec[3])) + 4 * dim + 32
+        rec_size = len(rec[1]) + len(rec[2] or "") + len(json.dumps(rec[3])) + (4 * dim + 16) * _vector_count(rec) + 16
         if current and size + rec_size > MAX_SEGMENT_BYTES:
             parts.append(_encode_segment(dim, current))
             current, size = [], 0
@@ -1496,7 +1735,16 @@ def _decode_v3(blob: bytes, key: str) -> tuple[int, list[tuple]]:
         return dim, []
     vectors = index.index.reconstruct_n(0, index.ntotal)
     row = {int(k): i for i, k in enumerate(faiss.vector_to_array(index.id_map))}
-    return dim, [(None, d, t, m, (vectors, row[int(k)])) for k, d, t, m in header["docs"]]
+    return dim, [(None, d, t, m, (vectors, row[int(k)]), None) for k, d, t, m in header["docs"]]
+
+
+def _collision(state: "_IndexState", doc_id: str, label: int) -> str | None:
+    """The other document already using FAISS id `label`, if any (see
+    `object_key_id`): writing `doc_id` would silently overwrite it."""
+    doc = state.docs.get(label)
+    if doc is None and label in state.owner:
+        doc = state.docs[state.owner[label][0]]
+    return None if doc is None or doc["doc_id"] == doc_id else doc["doc_id"]
 
 
 def _copy_metadata(metadata: dict) -> dict:
@@ -1521,6 +1769,36 @@ def _require_etag(etag: str | None, key: str) -> str:
     if not normalized:
         raise RuntimeError(f"object store returned no ETag for {key!r}")
     return normalized
+
+
+def _chunk_overlap_from_env() -> int | None:
+    """S3VAH_CHUNK_OVERLAP: tokens shared by consecutive chunks, or "off"."""
+    raw = os.environ.get("S3VAH_CHUNK_OVERLAP", "").strip().lower()
+    if not raw:
+        return DEFAULT_CHUNK_OVERLAP
+    if raw in ("off", "false", "none"):
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"S3VAH_CHUNK_OVERLAP must be a number of tokens or 'off', not {raw!r}") from None
+    if value < 0:
+        raise ValueError("S3VAH_CHUNK_OVERLAP must not be negative")
+    return value
+
+
+def _cache_budget_from_env() -> int | None:
+    """S3VAH_CACHE_MB: memory for loaded indexes per process, in MiB; unset: no limit."""
+    raw = os.environ.get("S3VAH_CACHE_MB", "").strip()
+    if not raw:
+        return None
+    try:
+        mb = float(raw)
+    except ValueError:
+        raise ValueError(f"S3VAH_CACHE_MB must be a number of MiB, not {raw!r}") from None
+    if mb < 0:
+        raise ValueError("S3VAH_CACHE_MB must not be negative")
+    return int(mb * 1024 * 1024)
 
 
 _store: VectorStore | None = None
@@ -1549,5 +1827,10 @@ def get_store() -> VectorStore:
                 # contend for cores: a 0.05 ms search over 1,000 docs took
                 # ~18 ms. A single-query flat search runs on one thread anyway.
                 faiss.omp_set_num_threads(1)
-                _store = VectorStore(client, OnnxEmbedder.from_hub())
+                _store = VectorStore(
+                    client,
+                    OnnxEmbedder.from_hub(),
+                    chunk_overlap=_chunk_overlap_from_env(),
+                    cache=IndexCache(_cache_budget_from_env()),
+                )
     return _store

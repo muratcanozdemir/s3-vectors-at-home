@@ -60,7 +60,7 @@ A bulk upload is all-or-nothing on validation: every document is checked first, 
 **Rules:**
 
 - **`doc_id`:** a non-empty string of up to 512 characters, without `/`.
-- **`text`:** any string. Text beyond the model's 256-token window doesn't affect the embedding, but it is stored in full.
+- **`text`:** any string, stored in full. A text longer than the model's 256-token window is split into chunks, and all of it is searchable; see [Long documents](#long-documents).
 - **`metadata`:** a flat object of up to 32 keys and 4 KB. Values are strings, numbers, booleans, or lists of those. Metadata is optional.
 
 ## Searching
@@ -80,7 +80,7 @@ curl -sf -X POST localhost:8000/indexes/papers/search -H 'content-type: applicat
 }
 ```
 
-- `matches` lists doc_ids, closest first. `results` has the same order, adding `score` (cosine similarity, −1 to 1, higher is closer) and the metadata.
+- `matches` lists doc_ids, closest first. `results` has the same order, adding `score` (cosine similarity, −1 to 1, higher is closer) and the metadata, and with `"passages": true` the best-matching passage (see [Long documents](#long-documents)).
 - `top_k` defaults to 5 and can be 1–1000. Fewer results come back if the index has fewer documents.
 
 Add a `filter` to search only documents whose metadata matches. Results stay exact: you get the true top-k among the matching documents.
@@ -92,6 +92,39 @@ curl -sf -X POST localhost:8000/indexes/papers/search -H 'content-type: applicat
 ```
 
 The filter language is in [Filters](filters.md).
+
+## Long documents
+
+The model reads at most 256 tokens (roughly 150–200 words) at a time. A longer text is split into chunks that fit, each sharing 32 tokens with the one before and never cutting a word in half, and every chunk gets its own vector. The document is still one document: getting, listing, counting, replacing and deleting work on the whole of it.
+
+- **Scoring:** a document scores as its best-matching chunk, and appears at most once in the results. `top_k` counts documents, not chunks.
+- **Passages:** add `"passages": true` to a search, and each result also has `passage`, the text of that best chunk, and `span`, its `[start, end)` character offsets in the document's text. For a document that wasn't split, the passage is the whole text.
+
+```bash
+curl -sf -X POST localhost:8000/indexes -H 'content-type: application/json' -d '{"name": "manuals"}'
+filler=$(for i in $(seq 1 60); do printf 'Section %s covers invoicing, tax codes and ledger reconciliation. ' "$i"; done)
+jq -n --arg f "$filler" '{docs: [
+  {doc_id: "handbook", text: ($f + "The lighthouse keeper feeds the seagulls sardines at dawn. " + $f)},
+  {doc_id: "ledger",   text: ($f + $f)}]}' \
+  | curl -sf -X POST localhost:8000/indexes/manuals/upload/bulk -H 'content-type: application/json' -d @-
+
+curl -sf -X POST localhost:8000/indexes/manuals/search -H 'content-type: application/json' \
+  -d '{"query": "lighthouse keeper feeding seagulls", "top_k": 1, "passages": true}' \
+  | jq -e '.matches == ["handbook"] and (.results[0].passage | contains("feeds the seagulls"))'
+curl -sf localhost:8000/indexes/manuals/status | jq -e '.document_count == 2 and .vector_count > 2'
+curl -sf -X DELETE localhost:8000/indexes/manuals
+```
+
+```json
+{"matches": ["handbook"], "results": [{"doc_id": "handbook", "score": 0.2221, "metadata": {},
+  "passage": "invoicing, tax codes and ledger reconciliation. Section 53 … The lighthouse keeper feeds the seagulls sardines at dawn. Section 1 … Section 10 covers invoicing, tax codes",
+  "span": [3375, 4633]}]}
+{"status": "ok", "index": "manuals", "document_count": 2, "vector_count": 14, "segments": 1, "storage_bytes": 37620, "embedding_model": "all-MiniLM-L6-v2", "cache": {...}}
+```
+
+The fact is in the middle of the handbook, far past its first 256 tokens. It's found in the chunk that contains it, which scores 0.22, while the best chunk of `ledger`, the same text without the fact, scores −0.09. Without chunking, both documents would have been embedded from the same opening and scored alike. (The passage is shortened here with `…`.)
+
+`S3VAH_CHUNK_OVERLAP` sets the overlap, or turns chunking off (see [Configuration](configuration.md#server)). The setting applies to documents as they are written: documents written earlier keep the vectors they have until they are written again.
 
 ## Reading, listing and deleting
 
@@ -119,9 +152,12 @@ curl -sf -X POST localhost:8000/indexes/papers/compact | jq -e '.segments == 1'
 ```
 
 ```json
-{"status": "ok", "index": "papers", "document_count": 3, "segments": 3, "storage_bytes": 6771, "embedding_model": "all-MiniLM-L6-v2"}
+{"status": "ok", "index": "papers", "document_count": 3, "vector_count": 3, "segments": 3, "storage_bytes": 6771, "embedding_model": "all-MiniLM-L6-v2",
+ "cache": {"indexes": 2, "bytes": 11623, "max_bytes": null, "evictions": 0}}
 {"status": "ok", "index": "papers", "document_count": 3, "segments": 1, "storage_bytes": 5008}
 ```
+
+`cache` is this worker process's memory for loaded indexes, all of them; see [Operations](operations.md#memory).
 
 Each write adds a small segment (three here: one upload, one bulk upload, one delete). Compaction normally runs by itself in the background, once there are enough segments to be worth merging. Calling it merges everything into one segment and reclaims the space held by overwritten and deleted documents. See [Operations](operations.md#compaction).
 

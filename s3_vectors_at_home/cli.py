@@ -44,7 +44,11 @@ def cmd_bulk_upload(args):
 def cmd_search(args):
     flt = _json_arg(args.filter, "filter") if args.filter else None
     store = get_store()
-    if args.scores:
+    if args.passages:
+        for r in store.search_with_scores(args.query, args.top_k, index=args.index, filter=flt, passages=True):
+            print(f"{r['score']:.4f}  {r['doc_id']}  [{r['span'][0]}:{r['span'][1]}]")
+            print("    " + " ".join(r["passage"].split()))
+    elif args.scores:
         for r in store.search_with_scores(args.query, args.top_k, index=args.index, filter=flt):
             print(f"{r['score']:.4f}  {r['doc_id']}")
     else:
@@ -78,7 +82,7 @@ def cmd_status(args):
     store = get_store()
     print(f"Index: {args.index}")
     stats = store.index_stats(index=args.index)
-    print(f"Documents: {stats['documents']}")
+    print(f"Documents: {stats['documents']} ({stats['vectors']} vectors)")
     print(f"Segments: {stats['segments']} ({stats['bytes']:,} bytes)")
     print(f"Embedding model: {store.embedding_model_name()}")
 
@@ -125,6 +129,7 @@ def main():
     s.add_argument("--top-k", type=int, default=5)
     s.add_argument("--filter", help='metadata filter as JSON, e.g. \'{"lang": "en"}\'')
     s.add_argument("--scores", action="store_true", help="Print one 'score  doc_id' line per match")
+    s.add_argument("--passages", action="store_true", help="Also print each match's best-matching passage")
     s.set_defaults(func=cmd_search)
 
     g = subp.add_parser("get", parents=[index_opt], help="Get a document by id")

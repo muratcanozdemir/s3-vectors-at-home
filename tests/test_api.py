@@ -115,3 +115,31 @@ def test_metadata_filter_and_named_indexes_over_http():
     assert client.post(f"/indexes/{name}/upload", json={"doc_id": "x", "text": "t"}).status_code == 404
     assert client.delete("/indexes/default").status_code == 400
     assert client.post("/indexes", json={"name": "Bad_Name"}).status_code == 400
+
+
+def test_a_fact_past_the_model_window_is_found_with_its_passage():
+    import uuid
+
+    name = f"api-{uuid.uuid4().hex[:8]}"
+    assert client.post("/indexes", json={"name": name}).status_code == 201
+    try:
+        base = f"/indexes/{name}"
+        filler = " ".join(f"Section {i} covers quarterly invoicing, tax codes and ledger reconciliation." for i in range(60))
+        fact = "The lighthouse keeper feeds the seagulls sardines every morning at dawn."
+        long_text = f"{filler} {fact} {filler}"
+        r = client.post(f"{base}/upload/bulk", json={"docs": [
+            {"doc_id": "handbook", "text": long_text},
+            # The same filler without the fact. Embedded truncated, as before
+            # chunking, both would be the same first 256 tokens of filler.
+            {"doc_id": "ledger", "text": f"{filler} {filler}"},
+        ]})
+        assert r.status_code == 200
+        status = client.get(f"{base}/status").json()
+        assert status["document_count"] == 2 and status["vector_count"] > 3
+        r = client.post(f"{base}/search", json={"query": "lighthouse keeper feeding seagulls", "top_k": 1, "passages": True})
+        hit = r.json()["results"][0]
+        assert hit["doc_id"] == "handbook"
+        assert fact in hit["passage"]
+        assert long_text[hit["span"][0]: hit["span"][1]] == hit["passage"]
+    finally:
+        assert client.delete(f"/indexes/{name}").status_code == 200

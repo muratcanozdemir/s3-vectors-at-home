@@ -135,11 +135,11 @@ def test_segment_codec_round_trip(seed):
         doc_id = "".join(rng.choices(alphabet, k=rng.randint(1, 8))) + str(i)
         seq = rng.choice([None, rng.randint(1, 10**12)])
         if rng.random() < 0.3:
-            records.append((seq, doc_id, None, None, None))
+            records.append((seq, doc_id, None, None, None, None))
         else:
             md = {"n": rng.randint(-(2**60), 2**60), "f": rng.random(), "l": ["x", True, 1.5]}
             block = nrng.normal(size=(1, dim)).astype(np.float32)
-            records.append((seq, doc_id, "".join(rng.choices(alphabet, k=rng.randint(0, 30))), md, (block, 0)))
+            records.append((seq, doc_id, "".join(rng.choices(alphabet, k=rng.randint(0, 30))), md, (block, 0), None))
     blob = core._encode_segment(dim, records)
     back = core._decode_segment(blob, "k", dim, 7)
     assert len(back) == len(records)

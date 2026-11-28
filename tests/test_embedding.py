@@ -11,6 +11,7 @@ and whitespace-only input, non-ASCII text.
 Downloads the pinned ONNX model (~90 MB) on first run; cached afterwards.
 """
 
+import itertools
 import json
 import pathlib
 
@@ -71,3 +72,39 @@ def test_shapes_and_unit_length(embedder):
 def test_semantic_sanity(embedder):
     cat, kitten, rocket = embedder.encode(["a cat sat on the mat", "a kitten sitting on a rug", "rocket engine thrust"])
     assert float(cat @ kitten) > float(cat @ rocket) + 0.2
+
+
+# -- chunking long texts --------------------------------------------------------
+
+LONG_TEXT = " ".join(
+    f"Sentence {i} talks about {'transformers' if i % 7 else 'gardening'}, antidisestablishmentarianism and çalışkanlık."
+    for i in range(120)
+)
+
+
+def _tokens(embedder, text):
+    return len(embedder._splitter.encode(text, add_special_tokens=False).ids)
+
+
+def test_a_text_that_fits_is_one_span(embedder):
+    text = "a short text"
+    assert embedder.chunk_spans(text) == [(0, len(text))]
+    assert embedder.chunk_spans("") == [(0, 0)]
+
+
+@pytest.mark.parametrize("overlap", [0, 32, 100])
+def test_chunks_fit_the_window_overlap_and_cover_the_text(embedder, overlap):
+    spans = embedder.chunk_spans(LONG_TEXT, overlap)
+    assert len(spans) > 1
+    for start, end in spans:
+        assert _tokens(embedder, LONG_TEXT[start:end]) <= embedder._window
+        # Never cut inside a word (punctuation is a word of its own).
+        assert start == 0 or not (LONG_TEXT[start - 1].isalnum() and LONG_TEXT[start].isalnum())
+        assert end == len(LONG_TEXT) or not (LONG_TEXT[end - 1].isalnum() and LONG_TEXT[end].isalnum())
+    assert spans[0][0] == 0 and spans[-1][1] == len(LONG_TEXT.rstrip())
+    for (s1, e1), (s2, _) in itertools.pairwise(spans):
+        assert s1 < s2
+        assert s2 <= e1 or not LONG_TEXT[e1:s2].strip()  # overlapping, or only whitespace between: nothing lost
+        shared = _tokens(embedder, LONG_TEXT[s2:e1]) if s2 < e1 else 0
+        assert shared >= min(overlap, embedder._window // 2) - 3  # about `overlap` tokens, rounded to words
+

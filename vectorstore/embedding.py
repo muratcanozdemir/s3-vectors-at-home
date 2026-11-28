@@ -27,6 +27,8 @@ MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 # are overridden below to match sentence-transformers.
 MAX_SEQ_LENGTH = 256
 DEFAULT_BATCH_SIZE = 32
+# Tokens consecutive chunks of a long text share (see `chunk_spans`).
+DEFAULT_CHUNK_OVERLAP = 32
 
 
 class OnnxEmbedder:
@@ -50,6 +52,12 @@ class OnnxEmbedder:
         pad_id = tok.token_to_id("[PAD]")
         tok.enable_padding(pad_id=0 if pad_id is None else pad_id, pad_token="[PAD]")  # pad to batch's longest
         self._tok = tok
+        # A second, untruncated tokenizer to measure and split long texts.
+        self._splitter = Tokenizer.from_file(tokenizer_path)
+        self._splitter.no_truncation()
+        self._splitter.no_padding()
+        # Room for the text in one model input, after [CLS] and [SEP].
+        self._window = max_seq_length - 2
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         if threads:
@@ -77,6 +85,37 @@ class OnnxEmbedder:
 
     def get_sentence_embedding_dimension(self) -> int:
         return self._dim
+
+    def chunk_spans(self, text: str, overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[tuple[int, int]]:
+        """Character spans [start, end) of `text` that each fit the model's window.
+
+        A text that fits is one span covering all of it. A longer one is cut
+        into windows of up to max_seq_length - 2 tokens, each sharing about
+        `overlap` tokens with the one before, and never splitting a word
+        (unless one word alone is longer than a window).
+        """
+        enc = self._splitter.encode(text, add_special_tokens=False)
+        n = len(enc.ids)
+        if n <= self._window:
+            return [(0, len(text))]
+        offsets, words = enc.offsets, enc.word_ids
+        overlap = max(0, min(overlap, self._window // 2))
+
+        def word_start(i: int, floor: int) -> int:
+            # Move i back to the first token of its word, but not to or below floor.
+            while i > floor + 1 and words[i] is not None and words[i] == words[i - 1]:
+                i -= 1
+            return i
+
+        spans, start = [], 0
+        while True:
+            end = min(start + self._window, n)
+            if end < n:
+                end = word_start(end, start)  # the next chunk starts the word instead
+            spans.append((offsets[start][0], offsets[end - 1][1]))
+            if end >= n:
+                return spans
+            start = max(word_start(end - overlap, start), start + 1)
 
     def encode(self, texts, normalize_embeddings: bool = True, batch_size: int | None = None) -> np.ndarray:
         """Embed `texts` -> float32 array of shape (len(texts), dim), in input order.

@@ -38,8 +38,10 @@ def get_service() -> S3VectorsService:
     if _service is None:
         from vectorstore.core import get_store
 
-        store = get_store()  # same MinIO client and bucket as the rest of the API
-        _service = S3VectorsService(store._client, store._bucket)
+        # Same MinIO client and bucket as the rest of the API, and the same
+        # memory budget for loaded indexes.
+        store = get_store()
+        _service = S3VectorsService(store._client, store._bucket, cache=store._cache_budget)
     return _service
 
 
