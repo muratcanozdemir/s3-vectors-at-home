@@ -74,6 +74,8 @@ def test_cli_named_index_metadata_and_filter():
         assert out == "Matches: ['b']"
         assert '"kind": "pets"' in run_cli(["get", "--index", name, "--doc-id", "a"])
         assert "Documents: 2" in run_cli(["status", "--index", name])
+        assert "2 documents in 1 segment(s)" in run_cli(["indexes", "compact", name])
+        assert "Segments: 1 " in run_cli(["status", "--index", name])
     finally:
         run_cli(["indexes", "delete", name])
     result = subprocess.run(

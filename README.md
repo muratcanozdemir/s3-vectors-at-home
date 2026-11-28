@@ -45,7 +45,8 @@ The original routes work on the `default` index. The same routes under `/indexes
 | `POST /upload/bulk` `{"docs": [...]}` | many at once; one bad doc rejects the whole batch |
 | `POST /search` `{"query", "top_k"?, "filter"?}` | `matches` (doc_ids, closest first) and `results` (`[{"doc_id", "score", "metadata"}]`) |
 | `GET /document/{doc_id}`, `DELETE /document/{doc_id}` | `{"doc_id", "text", "metadata"}` / delete |
-| `GET /documents?skip&limit`, `GET /status` | list docs (`text_preview`, `metadata`) / counts |
+| `GET /documents?skip&limit`, `GET /status` | list docs (`text_preview`, `metadata`) / document count, segments, storage bytes |
+| `POST /compact` | merge all segments and reclaim space (normally automatic) |
 
 For example, `POST /indexes/papers/search` with `{"query": "graph neural networks", "filter": {"year": {"$gte": 2022}}}`. `score` is cosine similarity (−1…1, higher is closer). Invalid input gets 400, unknown index or doc 404, and a write that lost to other writers too many times 503 with `Retry-After`.
 
@@ -63,22 +64,32 @@ s3-vectors-cli get --doc-id foo
 s3-vectors-cli list --skip 0 --limit 10
 s3-vectors-cli delete --doc-id foo
 s3-vectors-cli status --index papers
+s3-vectors-cli indexes compact papers                          # optional: merges happen automatically
 s3-vectors-cli indexes delete papers
 ```
 
 ## Behaviour worth knowing
-- **Storage.** Each index is one object, `indexes/<name>.v3.bin`, holding every document's text, metadata and vector together with the FAISS index. So a write replaces a document's text, metadata and vector together in one atomic PUT, and reads (get, list, count, filtering) are served from memory.
-- **Caching.** A loaded index is cached in memory. Each operation does a cheap `HEAD` on the index object and only reloads if its ETag changed, so writes from other processes are still picked up.
-- **Bulk upload is all-or-nothing on validation.** Every doc_id and metadata value is checked before anything is written, so one bad doc rejects the whole batch. The batch is embedded in one call and the index is written once. If a doc_id repeats within a batch, the last one wins.
-- **Many processes, one bucket.** Any number of API workers and CLI runs can read and write the same bucket at once. Index updates use compare-and-swap: each write is a conditional PUT (`If-Match` on the ETag it read, or `If-None-Match: *` to create), and a writer that loses the race reloads, re-applies its change on top and retries, so no update is lost. Because a doc is a single entry in that one object, concurrent writes to the *same* doc_id are safe too: the last successful write wins, as a whole. Requirements and limits:
+- **Storage.** An index is a small manifest, `indexes/<name>.manifest.json`, plus immutable *segments* under `segments/<name>/`. A write uploads one segment holding just its documents (text, metadata and vector together, or a delete marker), then appends it to the manifest. So a write costs the same at 50 documents or 50,000, and reads (get, list, count, filtering) are served from memory.
+- **Caching.** A loaded index is cached in memory. Each operation does a cheap `HEAD` on the manifest. When another process has written, only the new manifest and the segments it hasn't seen are downloaded, not the whole index.
+- **Compaction.** Segments are merged in the background after writes, size-tiered, so an index keeps a few dozen segments at most and each document is rewritten about log₂(n) times over its life. `POST /compact` (or `s3-vectors-cli indexes compact`) merges everything into one and reclaims the space of overwritten and deleted documents. You never need to run it, but it's there for a tidy index before a backup. It also deletes *orphaned* segments, ones a crash or failed write left behind that nothing references, once they are an hour old.
+- **Bulk upload is all-or-nothing on validation.** Every doc_id and metadata value is checked before anything is written, so one bad doc rejects the whole batch. The batch is embedded in one call and written as one segment. If a doc_id repeats within a batch, the last one wins.
+- **Many processes, one bucket.** Any number of API workers and CLI runs can read and write the same bucket at once. Each manifest update is compare-and-swap: a conditional PUT (`If-Match` on the ETag it read, or `If-None-Match: *` to create). A writer that loses the race reloads and appends the same segment on top, so no update is lost, and merges use the same mechanism. Every record gets a sequence number from the manifest, and a document's newest record wins, so concurrent writes to the *same* doc_id are safe too: the last one appended wins, as a whole. Requirements and limits:
   - The object store must enforce conditional PUTs (MinIO does, in releases since late 2024). The store checks this at startup and refuses to run if it doesn't, rather than quietly risk lost updates.
-  - Under extreme write contention a write can give up after 25 attempts: HTTP 503 with `Retry-After`, or CLI exit 1, with nothing half-applied. In testing, 32 processes writing flat out needed at most 16 attempts.
-  - A deleted index stays deleted: a write racing the delete fails with "index not found" instead of re-creating it.
-  - An index is written as a single PUT, so it is capped at 5 GiB of vectors plus text plus metadata.
-- **Cost of a write.** Every write re-uploads its whole index (vectors, texts and metadata). That's fine for thousands to tens of thousands of short documents (1,000 docs of ~200 characters are 1.7 MB). For much larger corpora, split them across indexes.
-- **Performance** (1,000 docs, laptop, local MinIO): bulk upload ~1.3 s, almost all of it the embedding model; single add ~13 ms; search ~3 ms (about 2 ms embedding the query, 1 ms checking the index's ETag); filtered search ~4 ms; get/list/count < 1 ms. The API loads the model and the default index at startup, so the first request isn't slow, and it fails at boot if MinIO is unreachable.
+  - All writes to one index pass through its manifest, so they top out at roughly 100+ per second across all processes. That's about 120/s with 32 processes writing flat out against local MinIO; every write succeeded, the slowest after 36 attempts. Batch writes (`/upload/bulk`) for more throughput. A write that keeps losing for 30 seconds gives up with HTTP 503 and `Retry-After`, or CLI exit 1, and nothing is applied.
+  - A deleted index stays deleted: a write racing the delete fails with "index not found" instead of re-creating it. Re-creating a name gives a fresh, empty index.
+  - Orphan cleanup assumes the clocks of the machines writing to a bucket agree to within ~45 minutes.
+- **Performance** (laptop, local MinIO). With 1,000 docs:
+  - bulk upload takes ~1.3 s, almost all of it the embedding model;
+  - search ~3 ms (about 2 ms embedding the query, 1 ms checking the manifest's ETag), filtered search ~4 ms;
+  - get, list and count take under 1 ms.
+
+  A single write stays ~6–12 ms and uploads ~6 KB whatever the index size. With the previous one-object layout it took 13 ms / 1.8 MB at 1,000 docs, 71 ms / 18 MB at 10,000 and 565 ms / 88 MB at 50,000. Loading a 50,000-doc index from scratch takes ~0.3 s. The API loads the model and the default index at startup, so the first request isn't slow, and it fails at boot if MinIO is unreachable.
 - **Limits.** `top_k` is 1–1000, `skip` ≥ 0, `limit` 0–1000 (out-of-range gets 422). Index names are 1–63 characters of `a-z`, `0-9` and `-`. A doc_id is up to 512 characters with no `/`.
-- **Upgrading from older versions.** The first time the default index is used, data in the old layouts (`index.v2.bin` or `faiss.index` + `index.ids.json`, with per-document `<id>.npy` / `<id>.meta.json` objects) is migrated into it, with empty metadata. The old objects are left untouched. Nothing reads them again, so delete them once you're sure you won't roll back. Don't run old and new versions against the same bucket at once: the old code wouldn't see writes made by the new.
+- **Upgrading from older versions.** Each index is migrated the first time it's used:
+  - from the previous one-object layout (`indexes/<name>.v3.bin`);
+  - for the default index, from the original layouts (`index.v2.bin` or `faiss.index` + `index.ids.json`, with per-document `<id>.npy` / `<id>.meta.json` objects), with empty metadata.
+
+  The old objects are left untouched (deleting an index also deletes its `.v3.bin`). Nothing reads them again, so delete them once you're sure you won't roll back. Don't run old and new versions against the same bucket at once: the old code wouldn't see writes made by the new.
 
 ## Running tests
 ```
@@ -89,7 +100,7 @@ export MINIO_SECRET_KEY=minioadmin123
 uv sync --all-extras
 uv run pytest
 ```
-`tests/test_vectorstore_golden.py` and `tests/test_filters.py` are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
+`tests/test_vectorstore_golden.py`, `tests/test_segments.py` and `tests/test_filters.py` are fast and need none of the above (fake MinIO client + fake embedder, no network). `tests/test_concurrency_minio.py` runs several writer processes against the real MinIO (`CAS_WORKERS=16` for a heavier run). The rest are end-to-end checks against the real MinIO and embedding model.
 
 # Contributing
 - Dependencies are locked (`uv.lock`, committed), so `uv sync` stays reproducible.

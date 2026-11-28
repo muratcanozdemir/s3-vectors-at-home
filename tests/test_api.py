@@ -103,6 +103,12 @@ def test_metadata_filter_and_named_indexes_over_http():
         assert client.post(f"{base}/upload", json={"doc_id": "bad", "text": "t", "metadata": {"a": {"b": 1}}}).status_code == 400
         assert client.delete(f"{base}/document/en").status_code == 200
         assert client.delete(f"{base}/document/en").status_code == 404
+        before = client.get(f"{base}/status").json()
+        assert before["segments"] >= 2 and before["storage_bytes"] > 0
+        after = client.post(f"{base}/compact").json()
+        assert (after["document_count"], after["segments"]) == (1, 1)
+        assert after["storage_bytes"] < before["storage_bytes"]
+        assert client.post(f"{base}/search", json={"query": "sourdough"}).json()["matches"] == ["de"]
     finally:
         assert client.delete(f"/indexes/{name}").status_code == 200
     assert client.get(f"/indexes/{name}/documents").status_code == 404

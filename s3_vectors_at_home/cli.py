@@ -74,7 +74,9 @@ def cmd_delete(args):
 def cmd_status(args):
     store = get_store()
     print(f"Index: {args.index}")
-    print(f"Documents: {store.count_documents(index=args.index)}")
+    stats = store.index_stats(index=args.index)
+    print(f"Documents: {stats['documents']}")
+    print(f"Segments: {stats['segments']} ({stats['bytes']:,} bytes)")
     print(f"Embedding model: {store.embedding_model_name()}")
 
 
@@ -86,6 +88,11 @@ def cmd_indexes_list(_args):
 def cmd_indexes_create(args):
     get_store().create_index(args.name)
     print(f"Created index {args.name}")
+
+
+def cmd_indexes_compact(args):
+    stats = get_store().compact(index=args.name)
+    print(f"Compacted index {args.name}: {stats['documents']} documents in {stats['segments']} segment(s), {stats['bytes']:,} bytes")
 
 
 def cmd_indexes_delete(args):
@@ -133,7 +140,7 @@ def main():
     st = subp.add_parser("status", parents=[index_opt], help="Show status and stats")
     st.set_defaults(func=cmd_status)
 
-    ix = subp.add_parser("indexes", help="List, create or delete indexes")
+    ix = subp.add_parser("indexes", help="List, create, delete or compact indexes")
     ixs = ix.add_subparsers(dest="indexes_cmd", required=True)
     ixs.add_parser("list", help="List indexes").set_defaults(func=cmd_indexes_list)
     c = ixs.add_parser("create", help="Create an index")
@@ -142,6 +149,9 @@ def main():
     dl = ixs.add_parser("delete", help="Delete an index and all its documents")
     dl.add_argument("name")
     dl.set_defaults(func=cmd_indexes_delete)
+    cp = ixs.add_parser("compact", help="Merge an index's segments and reclaim space from overwritten/deleted docs")
+    cp.add_argument("name", nargs="?", default=DEFAULT_INDEX)
+    cp.set_defaults(func=cmd_indexes_compact)
 
     args = ap.parse_args()
     try:
