@@ -58,6 +58,7 @@ def validate_metadata(metadata) -> dict:
     for key, value in metadata.items():
         if not isinstance(key, str) or not key:
             raise ValueError("metadata keys must be non-empty strings")
+        _require_unicode(key, value)
         if key.startswith("$"):
             raise ValueError(f"metadata key {key!r} must not start with '$'")
         if len(key) > MAX_KEY_LENGTH:
@@ -77,6 +78,17 @@ def validate_metadata(metadata) -> dict:
     if len(json.dumps(clean).encode()) > MAX_METADATA_BYTES:
         raise ValueError(f"metadata must serialise to at most {MAX_METADATA_BYTES} bytes of JSON")
     return clean
+
+
+def _require_unicode(key: str, value) -> None:
+    # Lone surrogates (valid in JSON, not in UTF-8) would make the stored
+    # JSON unreadable for other tools; reject them up front.
+    for s in [key, *(value if isinstance(value, list) else [value])]:
+        if isinstance(s, str):
+            try:
+                s.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError(f"metadata {key!r} must be valid Unicode (it contains a lone surrogate)") from None
 
 
 def validate_filter(flt, _depth: int = 0) -> None:
