@@ -9,6 +9,13 @@
 - This repo is meant to be a PoC of sorts, maybe will take it up a few levels of professionalism at some point.
 
 ## How to run
+With Docker, MinIO and the API together:
+```
+docker compose up -d --build     # API on http://localhost:8000, MinIO on :9000 (console :9001)
+```
+The image has the embedding model built in, so it never downloads anything at runtime. It runs as a non-root user and reports healthy once `GET /status` answers. Set `WEB_CONCURRENCY` for more API worker processes (they share the bucket safely), and `S3VAH_EMBED_THREADS` to about cores / workers. Releases also publish the image to `ghcr.io/muratcanozdemir/s3-vectors-at-home`.
+
+Or from source:
 ```
 docker compose -f minio/docker-compose.yaml up -d
 export MINIO_ENDPOINT=localhost:9000
@@ -143,3 +150,4 @@ uv run pytest
 # Contributing
 - Dependencies are locked (`uv.lock`, committed), so `uv sync` stays reproducible.
 - Embeddings run on ONNX Runtime, with no PyTorch. `vectorstore/embedding.py` reproduces sentence-transformers' `all-MiniLM-L6-v2` pipeline from the model files, pinned to an exact Hugging Face revision. `tests/test_embedding.py` checks it against reference vectors made by sentence-transformers, so vectors stay compatible with ones stored earlier. To change the model or revision, update both `MODEL_REVISION` and the CI cache key, then regenerate the reference: `uv run --with sentence-transformers==6.0.0 python scripts/make_embedding_fixture.py`.
+- Releasing: bump `version` in `pyproject.toml`, merge, then publish a GitHub release tagged `v<version>`. CI runs the tests, then publishes the wheel to PyPI with Trusted Publishing (no token; the tag must match the version) and pushes the image to `ghcr.io`.

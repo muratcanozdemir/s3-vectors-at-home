@@ -1,0 +1,21 @@
+# `docker compose up -d --build` runs MinIO and the API (http://localhost:8000).
+include:
+  - minio/docker-compose.yaml
+
+services:
+  api:
+    build: .
+    image: s3-vectors-at-home:local
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin123}
+      # API worker processes, and ONNX Runtime threads per worker (~ cores / workers).
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      S3VAH_EMBED_THREADS: ${S3VAH_EMBED_THREADS:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - minio
+    # The API refuses to start until MinIO answers, so retry while it boots.
+    restart: on-failure
