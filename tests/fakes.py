@@ -128,7 +128,7 @@ class FakeMinioClient:
 
 
 class FakeEmbedder:
-    """Deterministic stand-in for SentenceTransformer.
+    """Deterministic stand-in for the embedder (vectorstore.embedding.OnnxEmbedder).
 
     Maps each distinct text to a fixed, reproducible unit vector (seeded
     from a hash of the text) rather than a real semantic embedding. This is
