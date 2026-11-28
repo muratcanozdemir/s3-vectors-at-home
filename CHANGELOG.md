@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/muratcanozdemir/s3-vectors-at-home/compare/v0.1.0...v0.1.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* **ci:** tag images 0.1.0, 0.1 and latest, without the v ([985f675](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/985f675eb6cb92b444a8db0bea1ac678d4bfd0a5))
+* **compose:** give MinIO the same credentials as the API ([985f675](https://github.com/muratcanozdemir/s3-vectors-at-home/commit/985f675eb6cb92b444a8db0bea1ac678d4bfd0a5))
+
 ## 0.1.0 (2026-11-28)
 
 
