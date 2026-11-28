@@ -17,7 +17,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Lint
         run: uvx ruff check
-      - name: Docs build (strict: broken links and anchors fail)
+      - name: Docs build (strict, so broken links and anchors fail)
         run: uvx --with mkdocs-techdocs-core mkdocs build --strict --site-dir /tmp/site
       - name: Versions agree (pyproject.toml, uv.lock, release-please manifest)
         # release-please bumps all three in its release PR; a hand edit to one
